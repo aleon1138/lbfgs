@@ -13,11 +13,12 @@ Single entry point: `lbfgs.minimize(fun, x0, params)`.
 import numpy as np
 import lbfgs
 
-def fun(x):                       # returns (f, grad) of the *smooth* objective
+def fun(x):
+    # returns (f, grad) of the smooth objective
     r = A @ x - b
     return 0.5 * r.dot(r), A.T @ r
 
-res = lbfgs.minimize(fun, np.zeros(n))                              # plain L-BFGS
+res = lbfgs.minimize(fun, np.zeros(n))                                  # plain L-BFGS
 res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(l1_lambda=0.1))     # OWL-QN
 res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="hz"))  # Hager-Zhang
 print(res.theta, res.loss, res.reason)
@@ -57,7 +58,7 @@ res = lbfgs.minimize(fun, x0, lbfgs.Params(l1_lambda=0.1, l1_mask=[0]))
 ### 2. Flat / ill-conditioned smooth directions → Hager-Zhang
 
 SciPy's line searches enforce the standard (strong) Wolfe conditions, where
-*sufficient decrease* is a test on the function value:
+sufficient decrease is a test on the function value:
 
 $$
 \varphi(\alpha) \le \varphi(0) + c_1\,\alpha\,\varphi'(0)
@@ -65,17 +66,16 @@ $$
 
 Near the optimum, $\varphi(\alpha) - \varphi(0)$ shrinks to the scale of
 floating-point rounding error, so the value test turns into noise: the search
-either stalls without finding a Wolfe point or rejects a good step. This is the
-same regime that motivated 64-bit gradient accumulation in the sister project.
+either stalls without finding a Wolfe point or rejects a good step.
 
 Hager & Zhang (2005) replace the value-based decrease test with the approximate
-Wolfe condition, a *slope-based* test that tolerates the roundoff and still
+Wolfe condition, a slope-based test that tolerates the roundoff and still
 guarantees the curvature condition. Two things follow:
 
 * It keeps making progress on flat / ill-conditioned smooth directions where a
   value-based Wolfe search gives up — for example, the Student-t
-  degrees-of-freedom $\nu$ parameter in the sister project, a nearly flat
-  direction where backtracking Armijo crawls.
+  degrees-of-freedom $\nu$ parameter, a nearly flat direction where backtracking
+  Armijo crawls.
 * Because the curvature condition actually holds, every L-BFGS secant pair has
   $s^\top y > 0$, so the inverse-Hessian approximation stays trustworthy.
   Backtracking Armijo can't promise that (see the troubleshooting notes below).
@@ -87,15 +87,14 @@ evaluation per trial that backtracking already pays.
 res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hz"))
 ```
 
-`"hz"` is smooth-only. With `l1_lambda > 0` the orthant projection snaps
-variables to zero mid-step, so $\varphi(\alpha)$ is non-smooth and the
-slope-based machinery is unsound — that combination raises `ValueError`. Use the
-default `"armijo"` there.
+Note that we can only use `"hz"` in smooth-only optimizations. If we set `l1_lambda > 0` 
+the orthant projection snaps variables to zero mid-step, making the loss surface non-smooth. 
+This combination will raise `ValueError`.
 
 ### 3. Instrumentation
 
 Every iteration's loss, RMS pseudo-gradient, line-search count, and curvature
-diagnostics land in `Result.history`, a NumPy recarray. SciPy's compiled solvers
+diagnostics are recorded in `Result.history`, a NumPy recarray. SciPy's compiled solvers
 don't expose any of this; here it's the main debugging tool (see the
 troubleshooting checklist).
 
@@ -112,7 +111,7 @@ pip install -e .
 ### `minimize(fun, x0, params=None) -> Result`
 
 * `fun(x) -> (f, grad)` — the **smooth** objective value and gradient.
-* `x0` — initial point (copied; cast to float64 internally).
+* `x0` — initial point (copied and cast to float64 internally).
 * `params` — a `Params` instance (defaults used if `None`).
 
 ### `Params`
@@ -207,10 +206,9 @@ problem, switch to `line_search="hz"`.
 * Normalize features to zero mean and unit variance.
 * Normalize the objective by $n$ (per-observation loss $O(1)$, not $O(n)$).
 * Keep $\lambda$ on scale: after normalization gradients are $O(1)$, so
-  $\lambda \in [10^{-3}, 1]$.
+  $\lambda \in \[10^{-3}, 1\]$.
 * Watch `Result.history.curv_ok`: if more than ~20% of pairs are rejected
-  ($y^\top s < \texttt{curv\_eps}\cdot s^\top s$), something structural is off
-  (collinearity, scaling).
+  something structural is off (collinearity, scaling).
 * Watch `Result.history.ls_iter`: consistently hitting 20+ backtracks means the
   Hessian approximation is producing poor directions — reduce `m`, tighten
   `curv_eps`, or loosen `ls_c1` / `ls_c2` (Wolfe-only).
@@ -228,18 +226,9 @@ illustrative (dev machine, best-of-5):
 | lasso 20000×2000   | 4.7 ms  |     8 | 90% / 10%         |
 | cheap-highdim n=8000 | 2.3 ms |    20 | 9% / 91%          |
 
-Two regimes:
-
-* **Realistic problems**, where the gradient is a genuine matvec, are
-  **`fun`-dominated** ($\ge 90\%$). The optimizer's own overhead is negligible,
-  so rewriting it in C++ would gain almost nothing — the cost is in your
-  gradient, which is exactly why the sister project writes that part in C++. So
-  the optimizer stays pure Python.
-* **Cheap-loss / high-dimensional / small** problems are **optimizer-overhead
-  dominated**. The cProfile hotspot is `_two_loop_recursion` (the L-BFGS
-  direction) followed by per-iteration numpy allocations.
-
-If that overhead ever needs attention, the known wins are:
+For realistic problems, where the gradient is a genuine matvec, run costs are
+dominated by the gradient evaluation (`fun`). The optimizer's own overhead is 
+negligible. If we ever decide to spend some time on thins, the known wins are:
 
 * Store the `s/y` history as one contiguous 2D buffer instead of a deque of
   separately allocated vectors. This is the biggest single win: it turns
@@ -254,9 +243,11 @@ If that overhead ever needs attention, the known wins are:
 ## Testing
 
 ```bash
-make test           # pytest test/ -v
-make lint           # ruff check
-make profile        # python bench/profile_lbfgs.py
+# run unit tests
+pytest test/ -v
+
+# run profiling tests
+python bench/profile_lbfgs.py
 ```
 
 ## References
