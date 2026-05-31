@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lbfgs"
+version = "0.1.0"
+description = "Pure-Python L-BFGS / OWL-QN optimizer with a Hager-Zhang line search"
+readme = "README.md"
+authors = [
+    { name = "Arnaldo Leon", email = "amleon@alum.mit.edu" },
+]
+requires-python = ">=3.10"
+dependencies = ["numpy", "numba>=0.10"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["lbfgs*"]
+
+[project.urls]
+Source = "https://github.com/aleon1138/lbfgs"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
