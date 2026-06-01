@@ -21,6 +21,7 @@ def fun(x):
 res = lbfgs.minimize(fun, np.zeros(n))                                  # plain L-BFGS
 res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(l1_lambda=0.1))     # OWL-QN
 res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="hz"))  # Hager-Zhang
+res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="lewis_overton"))  # weak Wolfe
 print(res.theta, res.loss, res.reason)
 ```
 
@@ -122,11 +123,11 @@ pip install -e .
 | `max_iter`    | `800`      | iteration cap |
 | `l1_lambda`   | `0.0`      | L1 weight; `> 0` enables OWL-QN |
 | `gtol`        | `1e-6`     | RMS pseudo-gradient tolerance (see *Convergence*) |
-| `line_search` | `"armijo"` | `"armijo"` (backtracking) or `"hz"` (Hager-Zhang) |
+| `line_search` | `"armijo"` | `"armijo"` (backtracking), `"hz"` (Hager-Zhang), or `"lewis_overton"` (weak Wolfe) |
 | `ls_alpha0`   | `1.0`      | initial step size |
 | `ls_rho`      | `0.5`      | Armijo backtracking shrink factor |
 | `ls_c1`       | `1e-4`     | Armijo sufficient-decrease constant |
-| `ls_c2`       | `0.9`      | Wolfe curvature constant $\sigma$ (Hager-Zhang only) |
+| `ls_c2`       | `0.9`      | Wolfe curvature constant $\sigma$ (Hager-Zhang and Lewis-Overton) |
 | `ls_max_iter` | `40`       | max line-search iterations |
 | `curv_eps`    | `1e-12`    | minimum $y^\top s$ to accept a secant pair |
 | `l1_mask`     | `None`     | coordinate indices exempt from the L1 penalty |
@@ -174,8 +175,32 @@ $$
 For gradient descent the search direction is $p = -\nabla f(x)$; for L-BFGS it is
 $p = -H\,\nabla f(x)$ with $H$ the inverse-Hessian approximation.
 
-`"armijo"` (default, backtracking) works for every problem, including L1.
-`"hz"` (Hager-Zhang, approximate Wolfe) is smooth-only and described above.
+The package offers three, trading off the curvature guarantee, roundoff
+tolerance, and implementation complexity:
+
+| line search | guarantees curvature? | roundoff-tolerant? | complexity |
+| :--- | :--- | :--- | :--- |
+| Armijo (`"armijo"`) | ❌ | n/a (value-based test) | tiny |
+| Lewis-Overton (`"lewis_overton"`) | ✅ weak Wolfe | ❌ (value-based Armijo gate) | small (~30 lines) |
+| Hager-Zhang (`"hz"`) | ✅ approximate Wolfe | ✅ | large (~145 lines) |
+
+* **`"armijo"`** (default, backtracking) checks sufficient decrease only. It
+  works for every problem, including L1/OWL-QN — the only one that does — but
+  gives no curvature guarantee, so secant pairs can carry weak curvature (see the
+  troubleshooting notes).
+* **`"lewis_overton"`** (Lewis & Overton, 2013) adds the curvature condition with
+  a textbook bracket-and-bisect: keep a low/high bracket, bisect on overshoot,
+  double the step on undershoot, stop once both weak-Wolfe conditions hold.
+  Because curvature holds, every secant pair has $s^\top y > 0$. It is far simpler
+  than Hager-Zhang, but its sufficient-decrease gate is still value-based, so it
+  is **not** roundoff-tolerant — near a flat optimum it stalls just like any
+  value-based Wolfe search.
+* **`"hz"`** (Hager-Zhang, approximate Wolfe) also guarantees curvature *and*
+  stays sound in the float-roundoff regime near a flat optimum (described above),
+  at the cost of more machinery.
+
+Both `"hz"` and `"lewis_overton"` are smooth-only and raise `ValueError` under
+`l1_lambda > 0`; use `"armijo"` for L1.
 
 ## Troubleshooting
 
@@ -199,7 +224,9 @@ the Armijo step can land where the gradient has rotated substantially while
 $y^\top s$ is still positive, and the Hessian approximation slowly drifts. You'll
 see the iteration count climb, convergence stall, and the objective oscillate
 slightly. Reduce `m` so bad pairs age out faster, or, for an unregularized
-problem, switch to `line_search="hz"`.
+problem, switch to a Wolfe line search (`line_search="hz"`, or the simpler
+`"lewis_overton"`) — both enforce the curvature condition, so $y^\top s$ stays
+comfortably positive.
 
 ### Practical checklist
 
@@ -255,3 +282,4 @@ python bench/profile_lbfgs.py
 1. Andrew & Gao (2007), *Scalable Training of L1-Regularized Log-Linear Models.*
 2. Hager & Zhang (2005), *A new conjugate gradient method with guaranteed
    descent and an efficient line search.*
+3. Lewis & Overton (2013), *Nonsmooth optimization via quasi-Newton methods.*

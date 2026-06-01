@@ -16,6 +16,7 @@ Single entry point::
     res = lbfgs.minimize(fun, x0)                               # plain L-BFGS
     res = lbfgs.minimize(fun, x0, lbfgs.Params(l1_lambda=0.1))  # OWL-QN (L1)
     res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hz"))  # Hager-Zhang
+    res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="lewis_overton"))  # weak Wolfe
 
 where ``fun(x) -> (f, grad)`` returns the *smooth* objective and gradient; the
 L1 term, if any, is added internally. See ``Result`` for the optimum and a
