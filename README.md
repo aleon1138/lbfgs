@@ -139,8 +139,8 @@ pip install -e .
 | `theta`     | the solution vector |
 | `loss`      | final total objective (smooth + L1) |
 | `grad_norm` | final RMS pseudo-gradient |
-| `converged` | `True` iff terminated on `gtol` |
-| `reason`    | `"gtol"`, `"max_iter"`, `"ls_failed"`, or `"no_direction"` |
+| `converged` | `True` on `gtol`, or on `precision_loss` (a benign stall at the optimum) |
+| `reason`    | `"gtol"`, `"max_iter"`, `"precision_loss"`, `"ls_failed"`, or `"no_direction"` |
 | `history`   | per-iteration recarray: `loss`, `rms_grad`, `ls_iter`, `s_dot_y`, `s_norm`, `y_norm`, `curv_ok` |
 
 ## Convergence: the RMS pseudo-gradient

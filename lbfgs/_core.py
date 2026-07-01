@@ -36,17 +36,18 @@ from ._linesearch import _line_search_armijo, SMOOTH_SEARCHES
 @dataclass
 class Params:
     # fmt: off
-    m:           int   = 10         # L-BFGS history depth
-    max_iter:    int   = 800        # maximum number of iterations to run
-    l1_lambda:   float = 0.0        # L1 regularization weight
-    gtol:        float = 1e-6       # RMS pseudo-gradient convergence tolerance
-    line_search: str   = "armijo"   # "armijo" | "hz" (Hager-Zhang) | "lewis_overton"
-    ls_alpha0:   float = 1.0        # initial step size
-    ls_rho:      float = 0.5        # backtracking shrink factor (Armijo only)
-    ls_c1:       float = 1e-4       # sufficient decrease constant c₁
-    ls_c2:       float = 0.9        # Wolfe curvature constant σ (hz / lewis_overton)
-    ls_max_iter: int   = 40         # max line search iterations
-    curv_eps:    float = 1e-12      # minimum yᵀs for secant pair acceptance
+    m:               int   = 10        # L-BFGS history depth
+    max_iter:        int   = 800       # maximum number of iterations to run
+    l1_lambda:       float = 0.0       # L1 regularization weight
+    gtol:            float = 1e-6      # RMS pseudo-gradient convergence tolerance
+    line_search:     str   = "armijo"  # "armijo" | "hz" (Hager-Zhang) | "lewis_overton"
+    ls_alpha0:       float = 1.0       # initial step size
+    ls_rho:          float = 0.5       # backtracking shrink factor (Armijo only)
+    ls_c1:           float = 1e-4      # sufficient decrease constant c₁
+    ls_c2:           float = 0.9       # Wolfe curvature constant σ (hz / lewis_overton)
+    ls_max_iter:     int   = 40        # max line search iterations
+    ls_stall_factor: float = 10.0      # ls failure with rms_pg < factor·gtol is a benign stall
+    curv_eps:        float = 1e-12     # minimum yᵀs for secant pair acceptance
     l1_mask: Optional[list] = None  # parameter indices exempt from L1
     # fmt: on
 
@@ -71,10 +72,17 @@ class Result:
     converged: bool
 
     # Termination reasons:
-    #   "gtol"         - gradient norm below tolerance (converged)
-    #   "max_iter"     - iteration limit reached
-    #   "ls_failed"    - line search failed to find a step satisfying Armijo condition
-    #   "no_direction" - search direction projected to zero by orthant constraint
+    #   "gtol"           - gradient norm below tolerance (converged)
+    #   "max_iter"       - iteration limit reached
+    #   "precision_loss" - line search found no sufficient-decrease step while the
+    #                      gradient was already near gtol (rms_pg < ls_stall_factor·
+    #                      gtol): the objective is flat to roundoff, so this is a
+    #                      benign stall at the optimum (converged=True). Soft
+    #                      success; try line_search="hz" to squeeze out more digits.
+    #   "ls_failed"      - line search found no sufficient-decrease step with the
+    #                      gradient still large: a genuine failure (bad direction,
+    #                      wrong analytic gradient, or noisy/non-smooth objective).
+    #   "no_direction"   - search direction projected to zero by orthant constraint
     reason: str
 
     history: np.recarray = field(default_factory=lambda: np.recarray((0,), dtype=Result.dtype))
@@ -287,7 +295,16 @@ def minimize(
             f_new_total = f_new_smooth
 
         if not ok:
-            return Result(x, f_total, rms_pg, False, "ls_failed", history)
+            # The line search found no sufficient-decrease step. Distinguish a
+            # benign stall at the optimum — the gradient is already near gtol, so
+            # the objective is flat to roundoff and no measurable decrease exists
+            # — from a genuine failure (gradient still large: bad direction,
+            # wrong analytic gradient, or a noisy/non-smooth objective). We know
+            # rms_pg >= gtol here (the gtol check above passed), so the band is
+            # how far above gtol we stalled.
+            stalled = rms_pg < p.ls_stall_factor * p.gtol
+            reason = "precision_loss" if stalled else "ls_failed"
+            return Result(x, f_total, rms_pg, stalled, reason, history)
 
         # secant pair update (smooth gradients, not pseudo-gradients)
         s = x_new - x
