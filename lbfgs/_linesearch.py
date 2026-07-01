@@ -139,10 +139,18 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
 
     # Budget/bracket exhausted without a curvature-satisfying point: salvage the
     # best step that at least satisfied sufficient decrease (it still reduces φ;
-    # the driver's secant-pair guard rejects it if sᵀy ends up too small).
+    # the driver's secant-pair guard rejects it if sᵀy ends up too small) — but
+    # only if it actually moves x above the floating-point floor. On a flat
+    # direction near the optimum the bracket collapses to a step so small that
+    # x + t·d == x in float; returning that as success would make the driver
+    # re-take an identical null step every iteration until max_iter. When the
+    # best step is that small, report failure instead so the driver terminates
+    # cleanly (precision_loss) — this is exactly the roundoff regime where "hz"
+    # should be preferred.
     if best is not None:
         _, t, x_t, f_t, g_t = best
-        return x_t, f_t, g_t, t, n_eval, True
+        if np.linalg.norm(x_t - x) > 1e-16 * max(1.0, np.linalg.norm(x)):
+            return x_t, f_t, g_t, t, n_eval, True
     return x, phi0, g0, 0.0, n_eval, False
 
 
