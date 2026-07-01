@@ -25,6 +25,6 @@ per-iteration diagnostic history.
 
 from ._core import minimize, Params, Result
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["minimize", "Params", "Result", "__version__"]
