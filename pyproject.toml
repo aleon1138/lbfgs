@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lbfgs"
-version = "0.2.0"
+version = "0.3"
 description = "Pure-Python L-BFGS / OWL-QN optimizer with a Hager-Zhang line search"
 readme = "README.md"
 authors = [
@@ -21,6 +21,14 @@ include = ["lbfgs*"]
 
 [project.urls]
 Source = "https://github.com/aleon1138/lbfgs"
+
+[tool.pytest.ini_options]
+# Prepend the repo root to sys.path so `import lbfgs` always resolves to this
+# working tree, not to a copy installed in site-packages. Without this, a bare
+# `pytest` (unlike `python -m pytest`, which adds the CWD) silently tests the
+# installed package instead of the code under edit.
+pythonpath = ["."]
+testpaths = ["test"]
 
 [tool.ruff]
 line-length = 100
