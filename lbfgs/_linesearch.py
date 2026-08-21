@@ -37,6 +37,35 @@ _HZ_RHO   = 5.0     # bracket expansion factor while still descending (step B3)
 # fmt: on
 
 
+def _trial(fun, x, d, a):
+    """
+    Evaluate ``(φ(a), ∇f(x+a·d), φ'(a))``, mapping an overflowed trial point to
+    ``(+∞, g, +∞)``.
+
+    A trial step far enough out can overflow the objective, so ``fun`` hands back
+    a non-finite value or gradient. Projecting an infinite gradient onto ``d``
+    then yields NaN — numpy's "invalid value encountered in dot" — whenever the
+    infinities cancel or meet a zero component of ``d``. NaN compares False
+    against *everything*, so such a point reads as neither sufficient-decrease
+    nor overshoot: the bracketing logic below stops making sense and can march
+    further out instead of pulling back, eventually handing the driver a step
+    whose gradient is infinite.
+
+    Reporting ``φ = φ' = +∞`` instead makes every test read "this step is too
+    long", which is exactly what an overflow means, so the bracket shrinks back
+    toward ``x``. Such a point can never satisfy sufficient decrease, so it is
+    never returned as a step. Finiteness is checked *before* the dot product, so
+    the NaN — and its warning — is never produced in the first place.
+    """
+    f_a, g_a = fun(x + a * d)
+    if not (np.isfinite(f_a) and np.isfinite(g_a).all()):
+        return np.inf, g_a, np.inf
+    dphi_a = float(g_a.dot(d))
+    if not np.isfinite(dphi_a):  # gradient finite but the projection overflowed
+        return np.inf, g_a, np.inf
+    return float(f_a), g_a, dphi_a
+
+
 def _line_search_armijo(
     fun, total_obj, x, d, f0_total, g0_smooth, dg, alpha0, p, l1_lambda, l1_mask
 ):
@@ -108,30 +137,34 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
 
     phi0 = float(f0)
     dphi0 = float(dg)  # directional derivative at α=0, must be < 0
-    if dphi0 >= 0.0:  # not a descent direction; caller should have reset to -pg
+    # `not (dphi0 < 0)` rather than `dphi0 >= 0` so a NaN slope — an already
+    # non-finite gradient at x — is rejected too instead of falling through.
+    if not (dphi0 < 0.0):  # not a descent direction; caller should have reset to -pg
         return x, phi0, g0, 0.0, 0, False
 
     c1, c2 = p.ls_c1, p.ls_c2
     lo, hi = 0.0, np.inf
     t = max(alpha0, 1e-30)
-    best = None  # (φ, α, x, f, g) of the lowest-φ sufficient-decrease step, for salvage
+    best = None  # (φ, α, x, g) of the lowest-φ sufficient-decrease step, for salvage
 
     n_eval = 0
     while n_eval < p.ls_max_iter:
         x_t = x + t * d
-        f_t, g_t = fun(x_t)
+        # φ = φ' = +∞ on an overflowed trial, so the test below reads it as an
+        # overshoot and shrinks. Without that mapping φ' is NaN, every
+        # comparison is False, and the `else` branch would certify the
+        # overflowed point as a Wolfe step and hand its infinite gradient back.
+        phi_t, g_t, dphi_t = _trial(fun, x, d, t)
         n_eval += 1
-        phi_t = float(f_t)
-        dphi_t = float(g_t.dot(d))
 
         if phi_t > phi0 + c1 * t * dphi0:  # sufficient decrease fails -> overshoot
             hi = t
         elif dphi_t < c2 * dphi0:  # curvature fails -> undershoot, expand from here
             lo = t
             if best is None or phi_t < best[0]:
-                best = (phi_t, t, x_t, f_t, g_t)
+                best = (phi_t, t, x_t, g_t)
         else:  # both conditions hold -> weak Wolfe point
-            return x_t, f_t, g_t, t, n_eval, True
+            return x_t, phi_t, g_t, t, n_eval, True
 
         t = 0.5 * (lo + hi) if hi < np.inf else 2.0 * lo
         if hi < np.inf and hi - lo <= 1e-16 * max(1.0, hi):  # bracket collapsed
@@ -148,9 +181,9 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
     # cleanly (precision_loss) — this is exactly the roundoff regime where "hz"
     # should be preferred.
     if best is not None:
-        _, t, x_t, f_t, g_t = best
+        phi_t, t, x_t, g_t = best
         if np.linalg.norm(x_t - x) > 1e-16 * max(1.0, np.linalg.norm(x)):
-            return x_t, f_t, g_t, t, n_eval, True
+            return x_t, phi_t, g_t, t, n_eval, True
     return x, phi0, g0, 0.0, n_eval, False
 
 
@@ -180,7 +213,9 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
     eps_k = _HZ_EPS * abs(phi0)  # approximate-Wolfe tolerance (HZ's C_k ≈ |φ(0)|)
     max_eval = p.ls_max_iter
 
-    if dphi0 >= 0.0:  # not a descent direction; caller should have reset to -pg
+    # `not (dphi0 < 0)` rather than `dphi0 >= 0` so a NaN slope — an already
+    # non-finite gradient at x — is rejected too instead of falling through.
+    if not (dphi0 < 0.0):  # not a descent direction; caller should have reset to -pg
         return x, phi0, g0, 0.0, 0, False
 
     cache = {}  # α -> (φ(α), gradient, φ'(α)), avoids re-evaluating endpoints
@@ -204,9 +239,11 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
         hit = cache.get(a)
         if hit is not None:
             return hit
-        f_a, g_a = fun(x + a * d)
+        # φ = φ' = +∞ on an overflowed trial, which reads as an overshoot
+        # everywhere below (B1/U1 bracket it, `wolfe` rejects it, and it can
+        # never be salvaged) so the bracket pulls back into the finite region.
+        f_a, g_a, dphi_a = _trial(fun, x, d, a)
         n_eval[0] += 1
-        dphi_a = float(g_a.dot(d))
         cache[a] = (f_a, g_a, dphi_a)
         if wolfe(a, f_a, dphi_a):
             raise _Found(a)
@@ -216,7 +253,10 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
         denom = dphi_b - dphi_a
         if denom == 0.0:
             return 0.5 * (a + b)  # degenerate; fall back to midpoint
-        return (a * dphi_b - b * dphi_a) / denom
+        c = (a * dphi_b - b * dphi_a) / denom
+        if not np.isfinite(c):  # an endpoint slope is the +∞ overflow sentinel
+            return 0.5 * (a + b)
+        return c
 
     def bisect(a, b, dphi_a, dphi_b):
         # HZ update step U3: φ rose above tolerance with negative slope, so a

@@ -4,6 +4,7 @@ Unit tests for lbfgs.minimize (L-BFGS / OWL-QN + Hager-Zhang line search).
 """
 
 import unittest
+import warnings
 import numpy as np
 from lbfgs import minimize, Params
 from lbfgs import _linesearch
@@ -382,3 +383,109 @@ class TestLewisOverton(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertTrue(_weak_wolfe_holds(f, x0, d, alpha, p.ls_c1, p.ls_c2))
+
+
+class TestOverflowingObjective(unittest.TestCase):
+    """A trial step far enough out can overflow the objective, so `fun` returns a
+    non-finite value or gradient. The slope g·d is then NaN, which compares False
+    against every test, so an unguarded search reads such a point as neither
+    sufficient-decrease nor overshoot — it marches further out and hands the
+    driver an infinite gradient. The searches must instead read it as "step too
+    long" and pull back into the finite region."""
+
+    OVERFLOW_AT = 700.0
+
+    def _fun(self):
+        """φ(a) = -a along d, so the slope stays -1 and never satisfies curvature:
+        the bracket keeps expanding until it walks into the overflow region. The
+        value stays finite there — only the gradient blows up — so a value-based
+        gate cannot catch it either."""
+        n_eval = [0]
+
+        def f(z):
+            n_eval[0] += 1
+            if z[0] > self.OVERFLOW_AT:
+                return -z[0], np.array([np.inf, -np.inf])  # g·d -> inf - inf = NaN
+            return -z[0], np.array([-1.0, 0.0])
+
+        return f, n_eval
+
+    def _check(self, ls):
+        f, n_eval = self._fun()
+        x0 = np.array([0.0, 0.0])
+        d = np.array([1.0, 1.0])  # both components positive, so the infinities cancel
+        p = Params(ls_max_iter=40)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            x_new, _, g_new, alpha, _, ok = _call_smooth(ls, f, x0, d, 1.0, p)
+        spent = n_eval[0] - 1  # _call_smooth's own f(x0) call is not line-search budget
+
+        # No NaN is ever produced, so numpy never warns about the dot product.
+        self.assertEqual([str(w.message) for w in caught if "invalid value" in str(w.message)], [])
+        # Whatever is returned must be usable: an infinite gradient would poison
+        # the driver's secant history and turn every later direction into NaN.
+        self.assertTrue(np.all(np.isfinite(x_new)))
+        self.assertTrue(np.all(np.isfinite(np.asarray(g_new))))
+        if ok:
+            # The step stays inside the region where the objective is finite.
+            self.assertLessEqual(alpha, self.OVERFLOW_AT)
+            self.assertTrue(np.all(np.isfinite(f(x_new)[1])))
+        self.assertLessEqual(spent, p.ls_max_iter)
+
+    def test_hz_overflowed_trial_pulls_back(self):
+        """Hager-Zhang brackets an overflowed trial instead of expanding past it."""
+        self._check(_linesearch._line_search_hz)
+
+    def test_lo_overflowed_trial_pulls_back(self):
+        """Lewis-Overton must not certify an overflowed point as a Wolfe step."""
+        self._check(_linesearch._line_search_lewis_overton)
+
+    def test_nonfinite_slope_at_x_is_not_a_descent_direction(self):
+        """If the gradient at x is already non-finite the initial slope is NaN,
+        which is not a descent direction: the search must report failure rather
+        than run its whole budget on NaN comparisons."""
+
+        def f(z):
+            return 1.0, np.array([np.inf, -np.inf])
+
+        x0 = np.array([0.0, 0.0])
+        d = np.array([1.0, 1.0])
+        for ls in (_linesearch._line_search_hz, _linesearch._line_search_lewis_overton):
+            with self.subTest(ls=ls.__name__):
+                with warnings.catch_warnings(record=True):
+                    warnings.simplefilter("always")
+                    _, _, _, alpha, n_eval, ok = _call_smooth(ls, f, x0, d, 1.0, Params())
+                self.assertFalse(ok)
+                self.assertEqual(alpha, 0.0)
+                self.assertEqual(n_eval, 0)  # bailed before spending the budget
+
+    def test_minimize_survives_an_overflowing_gradient(self):
+        """End to end: a Poisson-style loss whose gradient overflows outside a
+        band still converges — the line search stays in the finite region."""
+        rng = np.random.default_rng(11)
+        X = rng.standard_normal((200, 4))
+        w_true = np.array([0.4, -0.3, 0.25, -0.1])
+        y = rng.poisson(np.exp(X @ w_true)).astype(np.float64)
+
+        def fun(w):
+            eta = X @ w
+            # Loss clipped for stability, gradient left unclipped: the classic
+            # mismatch that yields a finite value with an infinite gradient.
+            f = float(np.exp(np.clip(eta, -500.0, 500.0)).sum() - y @ eta)
+            g = X.T @ (np.exp(eta) - y)
+            return f, g
+
+        for ls in ("hz", "lewis_overton"):
+            with self.subTest(line_search=ls):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    res = minimize(
+                        fun, np.zeros(4), Params(line_search=ls, max_iter=300, gtol=1e-6)
+                    )
+                self.assertEqual(
+                    [str(w.message) for w in caught if "invalid value" in str(w.message)], []
+                )
+                self.assertTrue(np.all(np.isfinite(res.theta)))
+                self.assertEqual(res.reason, "gtol")
+                np.testing.assert_allclose(res.theta, w_true, atol=0.15)
