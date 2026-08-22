@@ -155,10 +155,17 @@ def _ill_conditioned_quad(n=30, seed=3, log10_kappa=4):
 
 
 def _call_smooth(ls, fun, x, d, alpha0, p):
-    """Invoke a smooth-only line search (signature: fun, x, d, f0, g0, dg, alpha0, p)."""
+    """
+    Invoke a smooth-only line search through the shared line-search interface,
+    returning it flattened to (x_new, f_new, g_new, alpha, n_eval, ok) — with
+    l1_lambda == 0 the f_total slot duplicates f_smooth, so drop it.
+    """
     f0, g0 = fun(x)
     dg = float(g0.dot(d))
-    return ls(fun, x, d, f0, g0, dg, alpha0, p)  # (x_new, f, g, alpha, n_eval, ok)
+    mask = np.ones_like(x, dtype=bool)
+    x_new, f_new, g_new, f_total, alpha, n_eval, ok = ls(fun, x, d, f0, f0, g0, dg, alpha0, p, mask)
+    assert f_total == f_new, "smooth search must report f_total == f_smooth"
+    return x_new, f_new, g_new, alpha, n_eval, ok
 
 
 class TestHagerZhang(unittest.TestCase):
@@ -625,3 +632,47 @@ class TestTwoLoopRecursion(unittest.TestCase):
             Params(m=3, gtol=1e-12),
         )
         self.assertEqual(r.reason, "gtol")  # a bounded window still converges
+
+
+class TestExhaustedBudget(unittest.TestCase):
+    """A line search that runs out of evaluations must report failure, not raise.
+
+    Hager-Zhang's bracketing phase ends with `return a, c, dphi_a, dphi_c`, but
+    with no budget the expansion loop never runs and dphi_c was never assigned --
+    an UnboundLocalError instead of a clean ok=False.
+    """
+
+    @staticmethod
+    def _bowl():
+        def f(z):
+            return 0.5 * float(z[0] ** 2), np.array([z[0]])
+
+        return f, np.array([-10.0]), np.array([1.0])
+
+    def _run(self, name, p):
+        f, x, d = self._bowl()
+        f0, g0 = f(x)
+        return _linesearch.LINE_SEARCHES[name](
+            f, x, d, f0, f0, g0, float(g0.dot(d)), 1.0, p, np.ones(1, dtype=bool)
+        )
+
+    def test_zero_budget_reports_failure(self):
+        """`Params` rejects ls_max_iter < 1, so reach the state by assigning past
+        the constructor -- the internal invariant should hold regardless."""
+        for name in sorted(_linesearch.LINE_SEARCHES):
+            with self.subTest(line_search=name):
+                p = Params(line_search=name)
+                p.ls_max_iter = 0
+                x_new, _, _, _, alpha, n_eval, ok = self._run(name, p)
+                self.assertFalse(ok)
+                self.assertEqual(n_eval, 0)
+                self.assertEqual(alpha, 0.0)
+                np.testing.assert_array_equal(x_new, self._bowl()[1])  # x unchanged
+
+    def test_tightest_real_budget_is_survivable(self):
+        for name in sorted(_linesearch.LINE_SEARCHES):
+            for budget in (1, 2, 3):
+                with self.subTest(line_search=name, ls_max_iter=budget):
+                    out = self._run(name, Params(line_search=name, ls_max_iter=budget))
+                    self.assertEqual(len(out), 7)
+                    self.assertIn(out[-1], (True, False))

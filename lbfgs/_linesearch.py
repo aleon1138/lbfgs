@@ -1,24 +1,39 @@
 """
 Line searches for the ``lbfgs`` package.
 
-Three step-length rules sharing the same job — given a descent direction ``d``
-at ``x``, find a step ``alpha`` that the L-BFGS driver can trust:
+Three step-length rules sharing the same job — given a descent direction ``d`` at
+``x``, find a step ``alpha`` the L-BFGS driver can trust:
 
-* **Armijo** (``"armijo"``) — backtracking on the *total* (smooth + L1)
-  objective with the OWL-QN orthant projection. The only rule valid under L1.
-  Tests sufficient decrease only, so it gives no curvature guarantee.
+* **Armijo** (``"armijo"``) — backtracking on the *total* (smooth + L1) objective
+  with the OWL-QN orthant projection. The only rule valid under L1. Tests
+  sufficient decrease only, so it gives no curvature guarantee.
 * **Lewis-Overton** (``"lewis_overton"``) — the textbook *weak Wolfe* search:
   bracket-and-bisect enforcing both sufficient decrease and the curvature
   condition, so every secant pair has ``sᵀy > 0``. Smooth-only. Its
   sufficient-decrease gate is value-based, hence not roundoff-tolerant.
 * **Hager-Zhang** (``"hz"``) — *approximate Wolfe*; like Lewis-Overton it gives
   the curvature condition, and additionally stays sound in the float-roundoff
-  regime near a flat optimum. Smooth-only, and the most machinery.
+  regime near a flat optimum. Smooth-only, and by far the most machinery.
 
-The smooth-only searches (``hz``, ``lewis_overton``) read the slope
-``φ'(α) = ∇f(x+αd)·d``, which the L1 orthant snapping makes discontinuous; the
-driver enforces ``l1_lambda == 0`` before dispatching to them (see
-``SMOOTH_SEARCHES``).
+Common interface
+----------------
+All three are registered in ``LINE_SEARCHES`` and share one signature so the
+driver can dispatch without branching::
+
+    ls(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask)
+        -> (x_new, f_new_smooth, g_new_smooth, f_new_total, alpha, n_eval, ok)
+
+``dg`` is the directional derivative ``φ'(0) = pgᵀd`` and must be negative;
+``p`` is the :class:`lbfgs.Params` in force. On ``ok=False`` no acceptable step
+was found and the tuple echoes the inputs back unchanged — a well-formed "no step
+taken" result, so a caller that ignores ``ok`` still gets consistent state rather
+than garbage.
+
+The two smooth-only searches take ``f0_total`` and ``l1_mask`` for signature
+uniformity and ignore them: the driver only dispatches to them when
+``l1_lambda == 0``, where ``f_total == f_smooth`` and there is no orthant to
+project onto. It has to, because they read the slope ``φ'(α) = ∇f(x+αd)·d``,
+which the L1 orthant snapping makes discontinuous (see ``SMOOTH_ONLY``).
 
 References:
 1. Hager & Zhang (2005), A new conjugate gradient method with guaranteed descent
@@ -28,6 +43,10 @@ References:
 
 import numpy as np
 
+from ._kernels import _total_objective
+
+# Hager-Zhang tuning constants, fixed at the paper's recommended values. Only the
+# curvature constant σ is exposed to the user, as `Params.ls_c2`.
 # fmt: off
 _HZ_DELTA = 0.1     # Wolfe sufficient-decrease constant δ (needs δ < min(0.5, σ))
 _HZ_EPS   = 1e-6    # approximate-Wolfe error tolerance factor: ε_k = ε·|φ(0)|
@@ -35,6 +54,9 @@ _HZ_THETA = 0.5     # bisection weight in the update step U3
 _HZ_GAMMA = 0.66    # bracket-shrink threshold in the main loop (step L2)
 _HZ_RHO   = 5.0     # bracket expansion factor while still descending (step B3)
 # fmt: on
+
+# Relative floor below which a step is indistinguishable from no step at all.
+_STEP_FLOOR = 1e-16
 
 
 def _trial(fun, x, d, a):
@@ -66,46 +88,54 @@ def _trial(fun, x, d, a):
     return float(f_a), g_a, dphi_a
 
 
-def _line_search_armijo(
-    fun, total_obj, x, d, f0_total, g0_smooth, dg, alpha0, p, l1_lambda, l1_mask
-):
+def _line_search_armijo(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     """
     Backtracking Armijo line search with the OWL-QN orthant projection.
 
     The only line search valid under L1 (``l1_lambda > 0``): it tests sufficient
     decrease on the *total* (smooth + L1) objective and snaps sign-changing
     coordinates to zero so coefficients can reach exactly 0. With
-    ``l1_lambda == 0`` the snapping and L1 term drop out and this is plain smooth
-    Armijo. It checks only sufficient decrease, so — unlike the Wolfe searches —
-    it cannot guarantee the curvature condition.
+    ``l1_lambda == 0`` the snapping and the L1 term drop out and this is plain
+    smooth Armijo. It checks only sufficient decrease, so — unlike the Wolfe
+    searches — it cannot guarantee the curvature condition.
 
-    ``total_obj(f_smooth, x) -> f_total`` is injected by the caller, so this
-    module never has to import the regularized objective from the driver.
-
-    Returns ``(x_new, f_new_smooth, g_new_smooth, f_new_total, alpha, n_eval, ok)``.
-    On ``ok=False`` no step satisfying sufficient decrease was found within
-    ``ls_max_iter`` evaluations.
+    Near the optimum the predicted decrease ``c₁·α·φ'(0)`` falls below the
+    roundoff of ``φ(0)``, the bound rounds back onto ``φ(0)`` itself, and the test
+    degenerates into "did not increase". That is deliberately left alone: the
+    objective value is uninformative at that scale, but the steps still are — on a
+    LASSO fit the last handful of iterations move ``φ`` by 1-2 ULP while cutting
+    the gradient by two orders of magnitude, so demanding a resolvable decrease
+    here would stop short of ``gtol``. The cost is that a genuinely stuck run
+    keeps taking unproductive steps until ``max_iter``; the driver catches only
+    the provable case, where ``x + α·d == x`` exactly. This is the roundoff wall
+    the approximate-Wolfe condition exists to climb over, so switch to
+    ``line_search="hz"`` if the last few digits matter.
     """
+    lam = p.l1_lambda
     alpha = alpha0
-    for ls_iter in range(1, p.ls_max_iter + 1):
+
+    for n_eval in range(1, p.ls_max_iter + 1):
         x_new = x + alpha * d
 
-        # snap sign changes to zero (orthant constraint)
-        if l1_lambda > 0.0:
+        # snap sign changes to zero (the OWL-QN orthant constraint)
+        if lam > 0.0:
             x_new[(x_new * x < 0.0) & l1_mask] = 0.0
 
-        f_new_smooth, g_new_smooth = fun(x_new)
-        f_new_total = total_obj(f_new_smooth, x_new)
+        f_new_smooth, g_new = fun(x_new)
+        f_new_total = f_new_smooth
+        if lam > 0.0:
+            f_new_total = _total_objective(f_new_smooth, x_new, lam, l1_mask)
 
-        if f_new_total <= f0_total + p.ls_c1 * alpha * dg:  # Armijo
-            return x_new, f_new_smooth, g_new_smooth, f_new_total, alpha, ls_iter, True
+        # Sufficient decrease: φ(α) ≤ φ(0) + c₁·α·φ'(0).
+        if f_new_total <= f0_total + p.ls_c1 * alpha * dg:
+            return x_new, f_new_smooth, g_new, f_new_total, alpha, n_eval, True
 
         alpha *= p.ls_rho
 
-    return x, f0_total, g0_smooth, f0_total, 0.0, p.ls_max_iter, False
+    return x, f0_smooth, g0, f0_total, 0.0, p.ls_max_iter, False
 
 
-def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
+def _line_search_lewis_overton(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     """
     Lewis-Overton weak-Wolfe line search (bracketing + bisection).
 
@@ -122,25 +152,20 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
     sufficient-decrease gate is value-based, so it is NOT roundoff-tolerant: on
     flat directions near the optimum prefer ``"hz"``.
 
-    SMOOTH OBJECTIVES ONLY. The curvature test reads the slope
-    φ'(α) = ∇f(x+αd)·d, which the L1 orthant snapping (sign-snapping) makes
-    discontinuous. The caller must enforce ``l1_lambda == 0`` before dispatching
-    here.
-
-    Returns ``(x_new, f_new, g_new, alpha, n_eval, ok)``. On ``ok=False`` no step
-    satisfying sufficient decrease was found within ``ls_max_iter`` evals.
+    Smooth objectives only; ``f0_total`` and ``l1_mask`` are unused (see the
+    module docstring).
     """
-    if not (0.0 < p.ls_c1 < p.ls_c2 < 1.0):
+    if not 0.0 < p.ls_c1 < p.ls_c2 < 1.0:
         raise ValueError(
             f"Lewis-Overton needs 0 < ls_c1 < ls_c2 < 1; got ls_c1={p.ls_c1}, ls_c2={p.ls_c2}"
         )
 
-    phi0 = float(f0)
+    phi0 = float(f0_smooth)
     dphi0 = float(dg)  # directional derivative at α=0, must be < 0
     # `not (dphi0 < 0)` rather than `dphi0 >= 0` so a NaN slope — an already
     # non-finite gradient at x — is rejected too instead of falling through.
     if not (dphi0 < 0.0):  # not a descent direction; caller should have reset to -pg
-        return x, phi0, g0, 0.0, 0, False
+        return x, phi0, g0, phi0, 0.0, 0, False
 
     c1, c2 = p.ls_c1, p.ls_c2
     lo, hi = 0.0, np.inf
@@ -151,9 +176,9 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
     while n_eval < p.ls_max_iter:
         x_t = x + t * d
         # φ = φ' = +∞ on an overflowed trial, so the test below reads it as an
-        # overshoot and shrinks. Without that mapping φ' is NaN, every
-        # comparison is False, and the `else` branch would certify the
-        # overflowed point as a Wolfe step and hand its infinite gradient back.
+        # overshoot and shrinks. Without that mapping φ' is NaN, every comparison
+        # is False, and the `else` branch would certify the overflowed point as a
+        # Wolfe step and hand its infinite gradient back.
         phi_t, g_t, dphi_t = _trial(fun, x, d, t)
         n_eval += 1
 
@@ -164,10 +189,10 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
             if best is None or phi_t < best[0]:
                 best = (phi_t, t, x_t, g_t)
         else:  # both conditions hold -> weak Wolfe point
-            return x_t, phi_t, g_t, t, n_eval, True
+            return x_t, phi_t, g_t, phi_t, t, n_eval, True
 
         t = 0.5 * (lo + hi) if hi < np.inf else 2.0 * lo
-        if hi < np.inf and hi - lo <= 1e-16 * max(1.0, hi):  # bracket collapsed
+        if hi < np.inf and hi - lo <= _STEP_FLOOR * max(1.0, hi):  # bracket collapsed
             break
 
     # Budget/bracket exhausted without a curvature-satisfying point: salvage the
@@ -176,38 +201,33 @@ def _line_search_lewis_overton(fun, x, d, f0, g0, dg, alpha0, p):
     # only if it actually moves x above the floating-point floor. On a flat
     # direction near the optimum the bracket collapses to a step so small that
     # x + t·d == x in float; returning that as success would make the driver
-    # re-take an identical null step every iteration until max_iter. When the
-    # best step is that small, report failure instead so the driver terminates
-    # cleanly (precision_loss) — this is exactly the roundoff regime where "hz"
-    # should be preferred.
+    # re-take an identical null step every iteration until max_iter. When the best
+    # step is that small, report failure instead so the driver terminates cleanly
+    # (precision_loss) — this is exactly the roundoff regime where "hz" wins.
     if best is not None:
         phi_t, t, x_t, g_t = best
-        if np.linalg.norm(x_t - x) > 1e-16 * max(1.0, np.linalg.norm(x)):
-            return x_t, phi_t, g_t, t, n_eval, True
-    return x, phi0, g0, 0.0, n_eval, False
+        if np.linalg.norm(x_t - x) > _STEP_FLOOR * max(1.0, np.linalg.norm(x)):
+            return x_t, phi_t, g_t, phi_t, t, n_eval, True
+    return x, phi0, g0, phi0, 0.0, n_eval, False
 
 
-def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
+def _line_search_hz(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     """
     Hager-Zhang line search satisfying the approximate Wolfe conditions.
 
-    Finds α minimizing φ(α) = f(x + αd) approximately, returning a step that
+    Finds α approximately minimizing φ(α) = f(x + αd), returning a step that
     satisfies either the ordinary Wolfe conditions or Hager & Zhang's
-    roundoff-tolerant "approximate Wolfe" variant. Unlike backtracking Armijo
-    this uses the slope φ'(α) = ∇f(x+αd)·d, which lets the curvature condition
-    hold and makes the L-BFGS secant pairs trustworthy.
+    roundoff-tolerant "approximate Wolfe" variant. Unlike backtracking Armijo it
+    uses the slope φ'(α) = ∇f(x+αd)·d, which lets the curvature condition hold and
+    makes the L-BFGS secant pairs trustworthy.
 
-    SMOOTH OBJECTIVES ONLY. The slope test assumes φ is differentiable, which
-    the L1 orthant projection (sign-snapping) violates. The caller must enforce
-    l1_lambda == 0 before dispatching here.
-
-    Returns (x_new, f_new, g_new, alpha, n_eval, ok). On `ok=False` no step
-    satisfying even sufficient decrease was found within `ls_max_iter` evals.
+    Smooth objectives only; ``f0_total`` and ``l1_mask`` are unused (see the
+    module docstring).
     """
-    if not (_HZ_DELTA < p.ls_c2 < 1.0):
+    if not _HZ_DELTA < p.ls_c2 < 1.0:
         raise ValueError(f"Hager-Zhang needs {_HZ_DELTA} < ls_c2 < 1; got ls_c2={p.ls_c2}")
 
-    phi0 = float(f0)
+    phi0 = float(f0_smooth)
     dphi0 = float(dg)  # directional derivative at α=0, must be < 0
     delta, sigma = _HZ_DELTA, p.ls_c2
     eps_k = _HZ_EPS * abs(phi0)  # approximate-Wolfe tolerance (HZ's C_k ≈ |φ(0)|)
@@ -216,12 +236,14 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
     # `not (dphi0 < 0)` rather than `dphi0 >= 0` so a NaN slope — an already
     # non-finite gradient at x — is rejected too instead of falling through.
     if not (dphi0 < 0.0):  # not a descent direction; caller should have reset to -pg
-        return x, phi0, g0, 0.0, 0, False
+        return x, phi0, g0, phi0, 0.0, 0, False
 
     cache = {}  # α -> (φ(α), gradient, φ'(α)), avoids re-evaluating endpoints
     n_eval = [0]
 
     class _Found(Exception):
+        """Unwind from the nested bracket/update helpers with an accepted step."""
+
         def __init__(self, a):
             self.a = a
 
@@ -240,8 +262,8 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
         if hit is not None:
             return hit
         # φ = φ' = +∞ on an overflowed trial, which reads as an overshoot
-        # everywhere below (B1/U1 bracket it, `wolfe` rejects it, and it can
-        # never be salvaged) so the bracket pulls back into the finite region.
+        # everywhere below (B1/U1 bracket it, `wolfe` rejects it, and it can never
+        # be salvaged) so the bracket pulls back into the finite region.
         f_a, g_a, dphi_a = _trial(fun, x, d, a)
         n_eval[0] += 1
         cache[a] = (f_a, g_a, dphi_a)
@@ -260,8 +282,8 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
 
     def bisect(a, b, dphi_a, dphi_b):
         # HZ update step U3: φ rose above tolerance with negative slope, so a
-        # minimizer is bracketed in [a, b]; shrink toward the low side until
-        # the opposite-slope condition (φ'(a)<0, φ'(b)≥0) is restored.
+        # minimizer is bracketed in [a, b]; shrink toward the low side until the
+        # opposite-slope condition (φ'(a)<0, φ'(b)≥0) is restored.
         while n_eval[0] < max_eval:
             c = (1.0 - _HZ_THETA) * a + _HZ_THETA * b
             phi_c, _, dphi_c = evald(c)
@@ -301,6 +323,7 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
         # HZ initial bracketing B: expand the trial point until the slope turns
         # non-negative (overshoot) or the objective rises above tolerance.
         a, dphi_a = 0.0, dphi0  # φ(0)=φ0 ≤ φ0+ε_k, φ'(0)<0
+        dphi_c = dphi0  # only used if the budget is exhausted before the first eval
         while n_eval[0] < max_eval:
             phi_c, _, dphi_c = evald(c)
             if dphi_c >= 0.0:  # B1: overshoot -> bracket [a, c]
@@ -309,11 +332,14 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
                 return bisect(0.0, c, dphi0, dphi_c)
             a, dphi_a = c, dphi_c  # B3: still descending below tolerance, expand
             c = _HZ_RHO * c
+        # Budget exhausted mid-expansion. [a, c] is not a valid bracket (c was
+        # never evaluated, so φ'(c) ≥ 0 does not hold), but the caller's loop is
+        # also out of budget and drops straight through to the salvage pass.
         return a, c, dphi_a, dphi_c
 
     def accept(a):
         phi_a, g_a, _ = cache[a]
-        return x + a * d, phi_a, g_a, a, n_eval[0], True
+        return x + a * d, phi_a, g_a, phi_a, a, n_eval[0], True
 
     try:
         a, b, dphi_a, dphi_b = bracket(max(alpha0, 1e-30))
@@ -323,13 +349,13 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
             if b - a > _HZ_GAMMA * w0:  # L2: insufficient shrink, force a bisection
                 c = 0.5 * (a + b)
                 a, b, dphi_a, dphi_b = update(a, b, c, dphi_a, dphi_b)
-            if b - a <= 1e-16 * max(1.0, b):  # interval collapsed, can't refine
+            if b - a <= _STEP_FLOOR * max(1.0, b):  # interval collapsed, can't refine
                 break
     except _Found as found:
         return accept(found.a)
 
-    # Budget exhausted without a Wolfe point: salvage the best step that at
-    # least satisfies sufficient decrease, else report failure.
+    # Budget exhausted without a Wolfe point: salvage the best step that at least
+    # satisfies sufficient decrease, else report failure.
     best = None
     for a_c, (phi_c, _, _) in cache.items():
         if a_c > 0.0 and phi_c <= phi0 + delta * a_c * dphi0:
@@ -337,13 +363,17 @@ def _line_search_hz(fun, x, d, f0, g0, dg, alpha0, p):
                 best = a_c
     if best is not None:
         return accept(best)
-    return x, phi0, g0, 0.0, n_eval[0], False
+    return x, phi0, g0, phi0, 0.0, n_eval[0], False
 
 
-# Smooth-only line searches (l1_lambda must be 0). The driver dispatches Armijo
-# separately because it carries the OWL-QN orthant context; these read the slope
-# and would be unsound under the L1 sign-snapping.
-SMOOTH_SEARCHES = {
+# The dispatch table the driver indexes with `Params.line_search`.
+LINE_SEARCHES = {
+    "armijo": _line_search_armijo,
     "hz": _line_search_hz,
     "lewis_overton": _line_search_lewis_overton,
 }
+
+# Searches that read the slope φ'(α) and so require a differentiable objective:
+# the driver rejects them when `l1_lambda > 0`, because the orthant snapping puts
+# a kink in φ wherever a coordinate crosses zero.
+SMOOTH_ONLY = frozenset({"hz", "lewis_overton"})

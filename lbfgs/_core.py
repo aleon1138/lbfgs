@@ -29,7 +29,7 @@ from typing import Callable, Tuple, Optional, ClassVar
 from collections import deque
 
 from ._kernels import _norm2, _pseudo_gradient, _total_objective
-from ._linesearch import _line_search_armijo, SMOOTH_SEARCHES
+from ._linesearch import LINE_SEARCHES, SMOOTH_ONLY
 # pyright: reportArgumentType=false
 
 
@@ -175,12 +175,11 @@ def minimize(
     p = Params() if params is None else params
     assert p.l1_lambda >= 0, "invalid L1 lambda"
 
-    valid_searches = {"armijo"} | set(SMOOTH_SEARCHES)
-    if p.line_search not in valid_searches:
+    if p.line_search not in LINE_SEARCHES:
         raise ValueError(
-            f"unknown line_search {p.line_search!r}; expected one of {sorted(valid_searches)}"
+            f"unknown line_search {p.line_search!r}; expected one of {sorted(LINE_SEARCHES)}"
         )
-    if p.line_search in SMOOTH_SEARCHES and p.l1_lambda > 0.0:
+    if p.line_search in SMOOTH_ONLY and p.l1_lambda > 0.0:
         # The Wolfe searches read the slope φ'(α), which the L1 orthant snapping
         # makes discontinuous, so we restrict them to smooth problems.
         raise ValueError(f"{p.line_search!r} requires l1_lambda == 0 (use 'armijo' for L1)")
@@ -190,10 +189,7 @@ def minimize(
     if p.l1_mask is not None and p.l1_lambda > 0.0:
         l1_mask[p.l1_mask] = False
 
-    # The regularized objective, bound over (l1_lambda, mask), injected into the
-    # Armijo search so the line-search module needn't import it from here.
-    def total_obj(f_smooth, xx):
-        return _total_objective(f_smooth, xx, p.l1_lambda, l1_mask)
+    line_search = LINE_SEARCHES[p.line_search]
 
     # secant pair history (bounded deques)
     secant_history = deque(maxlen=p.m)
@@ -236,19 +232,11 @@ def minimize(
             dg = pg.dot(d)
             alpha = 1.0 / pg_norm if pg_norm > 0.0 else 1.0
 
-        if p.line_search == "armijo":
-            # Backtracking Armijo with the OWL-QN orthant projection (the only
-            # search valid under L1).
-            x_new, f_new_smooth, g_new_smooth, f_new_total, _, ls_iter, ok = _line_search_armijo(
-                fun, total_obj, x, d, f_total, g_smooth, dg, alpha, p, p.l1_lambda, l1_mask
-            )
-        else:
-            # Smooth-only Wolfe search (hz / lewis_overton): l1_lambda == 0, so
-            # there is no orthant projection / snapping and f_total == f_smooth.
-            x_new, f_new_smooth, g_new_smooth, _, ls_iter, ok = SMOOTH_SEARCHES[p.line_search](
-                fun, x, d, f_smooth, g_smooth, dg, alpha, p
-            )
-            f_new_total = f_new_smooth
+        # All three searches share one interface (see lbfgs._linesearch), so
+        # there is nothing to branch on here.
+        x_new, f_new_smooth, g_new_smooth, f_new_total, _, ls_iter, ok = line_search(
+            fun, x, d, f_smooth, f_total, g_smooth, dg, alpha, p, l1_mask
+        )
 
         if not ok:
             # The line search found no sufficient-decrease step. Distinguish a
