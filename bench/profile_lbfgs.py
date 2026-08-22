@@ -99,7 +99,13 @@ class _Timed:
 
 
 def warmup():
-    """Trigger numba compilation for every jitted code path (lam==0 and lam>0)."""
+    """
+    Trigger numba compilation for every jitted kernel branch before timing.
+
+    The kernels in ``lbfgs._kernels`` specialize on ``lam == 0`` vs ``lam > 0``,
+    so a smooth solve and an L1 solve are both needed; the line searches are pure
+    Python but are exercised here anyway so the first timed call is warm.
+    """
     f, x0, p, _ = quadratic(6, seed=1)
     minimize(f, x0, p)
     f, x0, p, _ = quadratic(6, line_search="hz", seed=1)
@@ -145,8 +151,10 @@ def profile(fun, x0, params, label, top=15):
     s = io.StringIO()
     pstats.Stats(pr, stream=s).strip_dirs().sort_stats("tottime").print_stats(top)
     print(f"\n===== cProfile (tottime, top {top}) — {label} =====")
-    # keep only the table rows (drop the cProfile preamble noise)
-    keys = ("function calls", "ncalls", "{", "_core.py", "lbfgs")
+    # Keep only the table rows, dropping the cProfile preamble. `strip_dirs()`
+    # leaves bare filenames, so match the package's module names rather than a
+    # path -- and list all of them, or the line-search and kernel rows vanish.
+    keys = ("function calls", "ncalls", "{", "_core.py", "_kernels.py", "_linesearch.py")
     for line in s.getvalue().splitlines():
         if line.strip() and any(k in line for k in keys):
             print(line)

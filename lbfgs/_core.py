@@ -23,12 +23,12 @@ References:
 3. Lewis & Overton (2013), Nonsmooth optimization via quasi-Newton methods
 """
 
-import numba
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Callable, Tuple, Optional, ClassVar
 from collections import deque
 
+from ._kernels import _norm2, _pseudo_gradient, _total_objective
 from ._linesearch import _line_search_armijo, SMOOTH_SEARCHES
 # pyright: reportArgumentType=false
 
@@ -93,39 +93,6 @@ class Result:
             self.history = arr.view(np.recarray)
 
 
-@numba.njit
-def _norm2(x: np.ndarray) -> float:
-    """3x faster than numpy"""
-    z = 0.0
-    for i in range(len(x)):
-        z += x[i] ** 2
-    return np.sqrt(z)
-
-
-@numba.njit
-def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarray:
-    """
-    Compute the pseudo-gradient for the L1-regularized objective.
-
-    At x_i != 0: use the subgradient matching sign(x_i).
-    At x_i == 0: pick steepest descent from subdifferential [g_i - lam, g_i + lam],
-                 or 0 if the subdifferential contains 0.
-    """
-    if lam == 0.0:
-        return g.copy()
-
-    pg = np.empty_like(g)
-    for i in range(len(g)):
-        if mask[i]:
-            if x[i] != 0.0:
-                pg[i] = g[i] + np.copysign(lam, x[i])
-            else:
-                pg[i] = np.copysign(max(abs(g[i]) - lam, 0), g[i])  # soft-threshold
-        else:
-            pg[i] = g[i]
-    return pg
-
-
 def _two_loop_recursion(pg: np.ndarray, history: deque) -> np.ndarray:
     """
     Standard L-BFGS two-loop recursion.
@@ -141,12 +108,12 @@ def _two_loop_recursion(pg: np.ndarray, history: deque) -> np.ndarray:
         alphas[i] = rho * S.dot(q)
         q -= alphas[i] * Y
 
-    # initial Hessian scaling: gamma = (s^T y) / (y^T y) from most recent pair
+    # Initial Hessian scaling gamma = sᵀy / yᵀy from the most recent pair. rho is
+    # 1/sᵀy, so sᵀy comes back for free rather than costing another dot product.
     if k > 0:
-        S, Y, _ = history[-1]
+        _, Y, rho = history[-1]
         yy = Y.dot(Y)
-        gamma = S.dot(Y) / yy if yy > 0.0 else 1.0
-        r = gamma * q
+        r = q / (rho * yy) if yy > 0.0 else q
     else:
         r = q  # q is already a local copy
 
@@ -156,17 +123,6 @@ def _two_loop_recursion(pg: np.ndarray, history: deque) -> np.ndarray:
         r += (alphas[i] - beta) * S
 
     return -r
-
-
-@numba.njit
-def _total_objective(f_smooth: float, x: np.ndarray, lam: float, mask) -> float:
-    """f(x) + lambda * ||x||_1"""
-    if lam == 0.0:
-        return f_smooth
-    norm_1 = 0.0
-    for i in range(len(x)):
-        norm_1 += abs(x[i]) * (1 if mask[i] else 0)
-    return f_smooth + lam * norm_1
 
 
 def minimize(

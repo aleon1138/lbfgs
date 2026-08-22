@@ -5,9 +5,12 @@ Unit tests for lbfgs.minimize (L-BFGS / OWL-QN + Hager-Zhang line search).
 
 import unittest
 import warnings
+from collections import deque
+
 import numpy as np
-from lbfgs import minimize, Params
-from lbfgs import _linesearch
+
+from lbfgs import Params, minimize
+from lbfgs import _core, _kernels, _linesearch
 
 
 class TestMinimize(unittest.TestCase):
@@ -136,6 +139,21 @@ def _weak_wolfe_holds(loss_fn, x, d, alpha, c1, c2):
     return armijo and curvature
 
 
+def _ill_conditioned_quad(n=30, seed=3, log10_kappa=4):
+    """A quadratic with a controlled condition number, shared by several tests."""
+    rng = np.random.default_rng(seed)
+    eig = np.logspace(0, log10_kappa, n)
+    Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    A = (Q * eig) @ Q.T
+    A = 0.5 * (A + A.T)  # symmetrize away the QR's rounding asymmetry
+    b = rng.standard_normal(n)
+
+    def fn(x):
+        return 0.5 * x.dot(A @ x) - b.dot(x), A @ x - b
+
+    return fn, np.linalg.solve(A, b)
+
+
 def _call_smooth(ls, fun, x, d, alpha0, p):
     """Invoke a smooth-only line search (signature: fun, x, d, f0, g0, dg, alpha0, p)."""
     f0, g0 = fun(x)
@@ -175,18 +193,8 @@ class TestHagerZhang(unittest.TestCase):
         sᵀy > 0 — the property Armijo cannot guarantee."""
         # Moderately ill-conditioned quadratic (kappa ~ 1e4), where a weak line
         # search would otherwise admit pairs with marginal curvature.
-        n = 30
-        rng = np.random.default_rng(3)
-        eig = np.logspace(0, 4, n)
-        Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
-        A = (Q * eig) @ Q.T
-        A = 0.5 * (A + A.T)
-        b = rng.standard_normal(n)
-
-        def fn(x):
-            return 0.5 * x.dot(A @ x) - b.dot(x), A @ x - b
-
-        result = minimize(fn, np.zeros(n), Params(line_search="hz", max_iter=3000, gtol=1e-6))
+        fn, _ = _ill_conditioned_quad()
+        result = minimize(fn, np.zeros(30), Params(line_search="hz", max_iter=3000, gtol=1e-6))
         self.assertEqual(result.reason, "gtol")
         self.assertTrue(np.all(result.history.s_dot_y > 0.0))
         self.assertTrue(np.all(result.history.curv_ok))
@@ -290,31 +298,14 @@ class TestLewisOverton(unittest.TestCase):
         self.assertLessEqual(np.mean(result.history.ls_iter), 3.0)
 
     def test_lo_satisfies_curvature(self):
-        """LO enforces the weak Wolfe curvature condition, so every secant pair
-        has sᵀy > 0 — the property Armijo cannot guarantee. On this ill-conditioned
-        problem LO also degrades gracefully: being value-based it is not
-        roundoff-tolerant, so it bottoms out just short of gtol and reports a
-        benign ``precision_loss`` stall rather than spinning to ``max_iter``."""
+        """LO enforces the weak Wolfe curvature condition, so the secant pairs it
+        certifies have sᵀy > 0 — the property Armijo cannot guarantee."""
         # Same moderately ill-conditioned quadratic (kappa ~ 1e4) as the HZ test.
-        n = 30
-        rng = np.random.default_rng(3)
-        eig = np.logspace(0, 4, n)
-        Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
-        A = (Q * eig) @ Q.T
-        A = 0.5 * (A + A.T)
-        b = rng.standard_normal(n)
-
-        def fn(x):
-            return 0.5 * x.dot(A @ x) - b.dot(x), A @ x - b
-
+        fn, _ = _ill_conditioned_quad()
         result = minimize(
-            fn, np.zeros(n), Params(line_search="lewis_overton", max_iter=3000, gtol=1e-6)
+            fn, np.zeros(30), Params(line_search="lewis_overton", max_iter=3000, gtol=1e-6)
         )
-        # kappa ~ 1e4 is past LO's precision: it stalls just above gtol (unlike the
-        # roundoff-tolerant HZ, which reaches gtol on the same problem). This is a
-        # soft success — converged, not a genuine ls_failed.
-        self.assertEqual(result.reason, "precision_loss")
-        self.assertTrue(result.converged)
+        self.assertEqual(result.reason, "gtol")
         self.assertTrue(np.all(result.history.s_dot_y > 0.0))
         self.assertTrue(np.all(result.history.curv_ok))
 
@@ -489,3 +480,148 @@ class TestOverflowingObjective(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(res.theta)))
                 self.assertEqual(res.reason, "gtol")
                 np.testing.assert_allclose(res.theta, w_true, atol=0.15)
+
+
+class TestPseudoGradient(unittest.TestCase):
+    """The pseudo-gradient is the whole basis of OWL-QN, so pin it to the paper."""
+
+    @staticmethod
+    def _reference(g, x, lam, mask):
+        """Andrew & Gao (2007) sec. 3, transcribed one branch per case."""
+        out = np.empty_like(g)
+        for i in range(len(g)):
+            if not mask[i]:
+                out[i] = g[i]  # exempt from the penalty
+            elif x[i] > 0:
+                out[i] = g[i] + lam
+            elif x[i] < 0:
+                out[i] = g[i] - lam
+            elif g[i] + lam < 0:  # at zero: right partial derivative is negative
+                out[i] = g[i] + lam
+            elif g[i] - lam > 0:  # at zero: left partial derivative is positive
+                out[i] = g[i] - lam
+            else:  # 0 is in the subdifferential; the coordinate stays pinned
+                out[i] = 0.0
+        return out
+
+    def test_matches_the_reference_bit_for_bit(self):
+        rng = np.random.default_rng(0)
+        for _ in range(300):
+            n = int(rng.integers(1, 30))
+            x = rng.standard_normal(n) * rng.choice([0.0, 1.0, 5.0])
+            x[rng.random(n) < 0.4] = 0.0  # plenty of exact zeros, the interesting case
+            g = rng.standard_normal(n) * rng.choice([1e-2, 1.0, 1e2])
+            lam = float(rng.choice([0.0, 1e-8, 0.1, 1.0, 10.0]))
+            mask = rng.random(n) > 0.2
+            got = _kernels._pseudo_gradient(g, x, lam, mask)
+            want = g.copy() if lam == 0.0 else self._reference(g, x, lam, mask)
+            np.testing.assert_array_equal(got, want)
+
+    def test_is_a_descent_direction_for_the_total_objective(self):
+        """-pg must actually go downhill on f + lambda*||x||_1, including at the
+        kinks where some coordinates sit at exactly zero."""
+        rng = np.random.default_rng(1)
+        lam, n = 0.7, 8
+        for _ in range(200):
+            M = rng.standard_normal((n, n))
+            A = M.T @ M + np.eye(n)
+            b = rng.standard_normal(n)
+            x = np.where(rng.random(n) < 0.4, 0.0, rng.standard_normal(n))
+            total = lambda z: 0.5 * z.dot(A @ z) - b.dot(z) + lam * np.abs(z).sum()  # noqa: E731
+            pg = _kernels._pseudo_gradient(A @ x - b, x, lam, np.ones(n, dtype=bool))
+            if np.linalg.norm(pg) < 1e-12:
+                continue  # already optimal, nothing to descend
+            d = -pg / np.linalg.norm(pg)
+            t = 1e-7
+            self.assertLessEqual((total(x + t * d) - total(x)) / t, 1e-6)
+
+    def test_zero_lambda_is_the_plain_gradient(self):
+        g = np.array([1.0, -2.0, 0.0])
+        pg = _kernels._pseudo_gradient(g, np.zeros(3), 0.0, np.ones(3, dtype=bool))
+        np.testing.assert_array_equal(pg, g)
+        self.assertIsNot(pg, g)  # a copy: the driver must not alias the gradient
+
+    def test_total_objective(self):
+        rng = np.random.default_rng(2)
+        for _ in range(100):
+            n = int(rng.integers(1, 20))
+            x = rng.standard_normal(n)
+            mask = rng.random(n) > 0.3
+            lam, f = float(rng.choice([0.0, 0.3, 2.0])), float(rng.standard_normal())
+            self.assertAlmostEqual(
+                _kernels._total_objective(f, x, lam, mask),
+                f + lam * np.abs(x[mask]).sum(),
+                places=12,
+            )
+
+    def test_norm2_agrees_with_an_exact_reference(self):
+        """_norm2 runs with fastmath, which lets numba reassociate the reduction.
+        That is safe because every term is non-negative, but check it anyway."""
+        rng = np.random.default_rng(3)
+        for _ in range(200):
+            n = int(rng.integers(1, 5000))
+            x = rng.standard_normal(n) * 10.0 ** rng.integers(-8, 8)
+            exact = float(np.linalg.norm(x.astype(np.longdouble)))
+            self.assertLessEqual(abs(_kernels._norm2(x) - exact) / exact, 1e-13)
+
+
+class TestTwoLoopRecursion(unittest.TestCase):
+    """The two-loop recursion is an implicit matrix-vector product; check it
+    against the same product formed explicitly."""
+
+    @staticmethod
+    def _random_pairs(rng, n, k):
+        pairs = []
+        for _ in range(k):
+            s = rng.standard_normal(n)
+            y = s * rng.uniform(0.5, 2.0) + 0.05 * rng.standard_normal(n)
+            if s.dot(y) > 1e-9:  # only pairs the driver's guard would accept
+                pairs.append((s, y, 1.0 / s.dot(y)))
+        return pairs
+
+    def test_matches_the_dense_bfgs_recursion(self):
+        """d must equal -H@pg with H built by Nocedal & Wright eq. 6.17, starting
+        from the same gamma*I the implicit version uses."""
+        rng = np.random.default_rng(4)
+        for _ in range(100):
+            n, k = int(rng.integers(2, 15)), int(rng.integers(1, 8))
+            pairs = self._random_pairs(rng, n, k)
+            if not pairs:
+                continue
+            pg = rng.standard_normal(n)
+            s_new, y_new, _ = pairs[-1]  # gamma comes from the newest pair
+            H = (s_new.dot(y_new) / y_new.dot(y_new)) * np.eye(n)
+            for s, y, rho in pairs:  # oldest to newest
+                V = np.eye(n) - rho * np.outer(y, s)
+                H = V.T @ H @ V + rho * np.outer(s, s)
+            np.testing.assert_allclose(
+                _core._two_loop_recursion(pg, deque(pairs)), -(H @ pg), rtol=1e-9, atol=1e-11
+            )
+
+    def test_satisfies_the_secant_condition(self):
+        """With a single pair, H must map y to s exactly — the defining property
+        of a quasi-Newton update."""
+        rng = np.random.default_rng(5)
+        s = rng.standard_normal(6)
+        y = s * 1.3 + 0.01 * rng.standard_normal(6)
+        d = _core._two_loop_recursion(-y, deque([(s, y, 1.0 / s.dot(y))]))
+        np.testing.assert_allclose(d, s, rtol=1e-9)
+
+    def test_empty_history_is_steepest_descent(self):
+        pg = np.array([1.0, -2.0, 3.0])
+        np.testing.assert_array_equal(_core._two_loop_recursion(pg, deque()), -pg)
+
+    def test_does_not_mutate_the_gradient(self):
+        pg = np.array([1.0, -2.0, 3.0])
+        before = pg.copy()
+        rng = np.random.default_rng(6)
+        _core._two_loop_recursion(pg, deque(self._random_pairs(rng, 3, 4)))
+        np.testing.assert_array_equal(pg, before)
+
+    def test_history_depth_is_capped_at_m(self):
+        r = minimize(
+            lambda x: (0.5 * float(x.dot(x)) - x.sum(), x - 1.0),
+            np.zeros(50),
+            Params(m=3, gtol=1e-12),
+        )
+        self.assertEqual(r.reason, "gtol")  # a bounded window still converges
