@@ -155,11 +155,6 @@ def _line_search_lewis_overton(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p
     Smooth objectives only; ``f0_total`` and ``l1_mask`` are unused (see the
     module docstring).
     """
-    if not 0.0 < p.ls_c1 < p.ls_c2 < 1.0:
-        raise ValueError(
-            f"Lewis-Overton needs 0 < ls_c1 < ls_c2 < 1; got ls_c1={p.ls_c1}, ls_c2={p.ls_c2}"
-        )
-
     phi0 = float(f0_smooth)
     dphi0 = float(dg)  # directional derivative at α=0, must be < 0
     # `not (dphi0 < 0)` rather than `dphi0 >= 0` so a NaN slope — an already
@@ -224,9 +219,6 @@ def _line_search_hz(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     Smooth objectives only; ``f0_total`` and ``l1_mask`` are unused (see the
     module docstring).
     """
-    if not _HZ_DELTA < p.ls_c2 < 1.0:
-        raise ValueError(f"Hager-Zhang needs {_HZ_DELTA} < ls_c2 < 1; got ls_c2={p.ls_c2}")
-
     phi0 = float(f0_smooth)
     dphi0 = float(dg)  # directional derivative at α=0, must be < 0
     delta, sigma = _HZ_DELTA, p.ls_c2

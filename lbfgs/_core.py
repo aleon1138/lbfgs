@@ -22,19 +22,30 @@ References:
    and an efficient line search
 3. Lewis & Overton (2013), Nonsmooth optimization via quasi-Newton methods
 """
+# pyright: reportArgumentType=false
+
+from collections import deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Callable, Tuple, Optional, ClassVar
-from collections import deque
 
 from ._kernels import _norm2, _pseudo_gradient, _total_objective
-from ._linesearch import LINE_SEARCHES, SMOOTH_ONLY
-# pyright: reportArgumentType=false
+from ._linesearch import _HZ_DELTA, LINE_SEARCHES, SMOOTH_ONLY
+
+Objective = Callable[[np.ndarray], tuple[float, np.ndarray]]
 
 
 @dataclass
 class Params:
+    """
+    Configuration for :func:`minimize`. Every field has a usable default.
+
+    Validated on construction (and again by :func:`minimize`, in case a field was
+    reassigned afterwards). The README documents how to tune these.
+    """
+
     # fmt: off
     m:               int   = 10        # L-BFGS history depth
     max_iter:        int   = 800       # maximum number of iterations to run
@@ -48,235 +59,316 @@ class Params:
     ls_max_iter:     int   = 40        # max line search iterations
     ls_stall_factor: float = 10.0      # ls failure with rms_pg < factor·gtol is a benign stall
     curv_eps:        float = 1e-12     # minimum yᵀs for secant pair acceptance
-    l1_mask: Optional[list] = None  # parameter indices exempt from L1
+    l1_mask: Sequence[int] | np.ndarray | None = None  # parameter indices exempt from L1
     # fmt: on
+
+    def __post_init__(self):
+        self._validate()
+
+    def _validate(self):
+        """Raise ValueError on any combination the solver cannot honour."""
+        if self.m < 1:
+            raise ValueError(f"m must be >= 1; got {self.m}")
+        if self.max_iter < 0:
+            raise ValueError(f"max_iter must be >= 0; got {self.max_iter}")
+        if self.l1_lambda < 0.0:
+            raise ValueError(f"l1_lambda must be >= 0; got {self.l1_lambda}")
+        if self.ls_max_iter < 1:
+            raise ValueError(f"ls_max_iter must be >= 1; got {self.ls_max_iter}")
+        if not 0.0 < self.ls_rho < 1.0:
+            raise ValueError(f"ls_rho must be in (0, 1); got {self.ls_rho}")
+
+        if self.line_search not in LINE_SEARCHES:
+            raise ValueError(
+                f"unknown line_search {self.line_search!r}; expected one of {sorted(LINE_SEARCHES)}"
+            )
+        if self.line_search in SMOOTH_ONLY and self.l1_lambda > 0.0:
+            # The Wolfe searches read the slope φ'(α), which the L1 orthant
+            # snapping makes discontinuous, so they are smooth-only.
+            raise ValueError(f"{self.line_search!r} requires l1_lambda == 0 (use 'armijo' for L1)")
+
+        # Each Wolfe search constrains its own constants.
+        if self.line_search == "hz" and not _HZ_DELTA < self.ls_c2 < 1.0:
+            raise ValueError(f"Hager-Zhang needs {_HZ_DELTA} < ls_c2 < 1; got {self.ls_c2}")
+        if self.line_search == "lewis_overton" and not 0.0 < self.ls_c1 < self.ls_c2 < 1.0:
+            raise ValueError(
+                "Lewis-Overton needs 0 < ls_c1 < ls_c2 < 1; "
+                f"got ls_c1={self.ls_c1}, ls_c2={self.ls_c2}"
+            )
 
 
 @dataclass
 class Result:
+    """
+    What :func:`minimize` returns.
+
+    Attributes
+    ----------
+    theta : ndarray
+        The final point — the solution, if ``converged``.
+    loss : float
+        The total objective (smooth + L1) at ``theta``.
+    rms_grad : float
+        RMS pseudo-gradient at ``theta``, the quantity compared against
+        ``Params.gtol``. See *Convergence* in the README for why it is an RMS.
+    converged : bool
+        True for the ``"gtol"`` and ``"precision_loss"`` reasons below.
+    reason : str
+        Why the solver stopped:
+
+        ``"gtol"``
+            RMS pseudo-gradient fell below ``gtol``. Converged.
+        ``"max_iter"``
+            Iteration limit reached.
+        ``"precision_loss"``
+            The line search found no sufficient-decrease step while the gradient
+            was already near ``gtol`` (``rms_grad < ls_stall_factor·gtol``): the
+            objective is flat to roundoff, so this is a benign stall at the
+            optimum, reported as converged. Try ``line_search="hz"`` to squeeze
+            out more digits.
+        ``"ls_failed"``
+            The line search found no sufficient-decrease step with the gradient
+            still large — a genuine failure: bad direction, wrong analytic
+            gradient, or a noisy/non-smooth objective.
+        ``"no_direction"``
+            The search direction was projected to zero by the orthant constraint.
+    nit : int
+        Iterations completed; always equals ``len(history)``.
+    nfev : int
+        Calls made to ``fun``, including the line search's trial evaluations.
+    history : recarray
+        Per-iteration diagnostics, one row per completed iteration; see
+        :attr:`Result.dtype` for the fields and how to read them.
+    """
+
     # fmt: off
     dtype: ClassVar = [
         ("loss",     "f8"),
         ("rms_grad", "f8"),
-        ("ls_iter",  "i4"),   # should be ≤ 5 on average; >10 is a warning sign
-        ("s_dot_y",  "f8"),   # cos(θ) = yᵀs / s_norm / y_norm, should be > 0
-        ("s_norm",   "f8"),   # histogram this; a mass near 0 is a red flag
-        ("y_norm",   "f8"),   # compare yᵀs distribution against `curv_eps`
-        ("curv_ok",  "b1"),   # if <20% ok, check for ill-conditioning or poor line search
+        ("ls_iter",  "i4"),   # trials the line search spent; ≤5 on average, >10 is a warning
+        ("s_dot_y",  "f8"),   # yᵀs, the curvature of the accepted step; should be > 0
+        ("s_norm",   "f8"),   # ||s||; histogram it, a mass near 0 means stalled steps
+        ("y_norm",   "f8"),   # ||y||; with s_dot_y gives cos θ = yᵀs/(‖s‖‖y‖)
+        ("curv_ok",  "b1"),   # was the pair kept? <20% means ill-conditioning or a weak search
     ]
     # fmt: on
 
     theta: np.ndarray
     loss: float
-    grad_norm: float
+    rms_grad: float
     converged: bool
-
-    # Termination reasons:
-    #   "gtol"           - gradient norm below tolerance (converged)
-    #   "max_iter"       - iteration limit reached
-    #   "precision_loss" - line search found no sufficient-decrease step while the
-    #                      gradient was already near gtol (rms_pg < ls_stall_factor·
-    #                      gtol): the objective is flat to roundoff, so this is a
-    #                      benign stall at the optimum (converged=True). Soft
-    #                      success; try line_search="hz" to squeeze out more digits.
-    #   "ls_failed"      - line search found no sufficient-decrease step with the
-    #                      gradient still large: a genuine failure (bad direction,
-    #                      wrong analytic gradient, or noisy/non-smooth objective).
-    #   "no_direction"   - search direction projected to zero by orthant constraint
     reason: str
-
+    nit: int = 0
+    nfev: int = 0
     history: np.recarray = field(default_factory=lambda: np.recarray((0,), dtype=Result.dtype))
 
     def __post_init__(self):
         if not isinstance(self.history, np.recarray):
-            arr = np.asarray(self.history, dtype=Result.dtype)
-            self.history = arr.view(np.recarray)
+            self.history = np.asarray(self.history, dtype=Result.dtype).view(np.recarray)
 
 
-def _two_loop_recursion(pg: np.ndarray, history: deque) -> np.ndarray:
+class _Counted:
+    """Wraps the user's objective to count evaluations for ``Result.nfev``."""
+
+    __slots__ = ("fun", "n")
+
+    def __init__(self, fun: Objective):
+        self.fun = fun
+        self.n = 0
+
+    def __call__(self, x: np.ndarray) -> tuple[float, np.ndarray]:
+        self.n += 1
+        return self.fun(x)
+
+
+def _two_loop_recursion(pg: np.ndarray, secant_history: deque) -> np.ndarray:
     """
     Standard L-BFGS two-loop recursion.
-    Returns d = -H @ pg, where H is the inverse Hessian approximation.
+
+    Returns ``d = -H @ pg``, where ``H`` is the implicit inverse-Hessian
+    approximation built from the stored ``(s, y, 1/sᵀy)`` triples, oldest first.
+    With no history this is plain steepest descent, ``d = -pg``.
     """
-    k = len(history)
+    k = len(secant_history)
     q = pg.copy()
     alphas = np.empty(k)
 
     # backward pass: newest to oldest
     for i in range(k - 1, -1, -1):
-        S, Y, rho = history[i]
-        alphas[i] = rho * S.dot(q)
-        q -= alphas[i] * Y
+        s, y, rho = secant_history[i]
+        alphas[i] = rho * s.dot(q)
+        q -= alphas[i] * y
 
-    # Initial Hessian scaling gamma = sᵀy / yᵀy from the most recent pair. rho is
+    # Initial Hessian scaling γ = sᵀy / yᵀy from the most recent pair. rho is
     # 1/sᵀy, so sᵀy comes back for free rather than costing another dot product.
     if k > 0:
-        _, Y, rho = history[-1]
-        yy = Y.dot(Y)
+        _, y, rho = secant_history[-1]
+        yy = y.dot(y)
         r = q / (rho * yy) if yy > 0.0 else q
     else:
         r = q  # q is already a local copy
 
     # forward pass: oldest to newest
-    for i, (S, Y, rho) in enumerate(history):
-        beta = rho * Y.dot(r)
-        r += (alphas[i] - beta) * S
+    for i, (s, y, rho) in enumerate(secant_history):
+        beta = rho * y.dot(r)
+        r += (alphas[i] - beta) * s
 
     return -r
 
 
-def minimize(
-    fun: Callable[[np.ndarray], Tuple[float, np.ndarray]],
-    x0: np.ndarray,
-    params: Optional[Params] = None,
-) -> Result:
+def minimize(fun: Objective, x0: np.ndarray, params: Params | None = None) -> Result:
     """
-    Minimize ``f(x) + lambda * ||x||_1`` with L-BFGS / OWL-QN.
+    Minimize ``f(x) + l1_lambda·||x||₁`` with L-BFGS / OWL-QN.
 
-    With ``params.l1_lambda == 0`` this is plain L-BFGS. With ``l1_lambda > 0``
-    it is OWL-QN: the L1 term is handled internally via the pseudo-gradient and
-    orthant projection, so `fun` only ever sees the smooth part.
+    With ``params.l1_lambda == 0`` this is plain L-BFGS. With ``l1_lambda > 0`` it
+    is OWL-QN: the L1 term is handled internally via the pseudo-gradient and
+    orthant projection, so ``fun`` only ever sees the smooth part.
 
     Parameters
     ----------
     fun : callable
-        Takes x, returns (f_smooth, grad_smooth) — the smooth part only.
-        The L1 term is handled internally.
+        ``fun(x) -> (f, grad)`` for the **smooth** part of the objective only.
     x0 : ndarray
-        Initial point.
+        Initial point; a non-empty 1-D array, copied and cast to float64.
     params : Params, optional
-        Algorithm parameters.
+        Algorithm parameters; defaults used if ``None``.
 
-    Params object
-    -------------
-        gtol:        RMS pseudo-gradient threshold. If your loss sums over n
-                     samples in f64, scale by sqrt(n) to clear the accumulation
-                     noise floor.
-        line_search: "armijo" (default) backtracking; "hz" for Hager-Zhang
-                     (approximate Wolfe); or "lewis_overton" (weak Wolfe). Both
-                     "hz" and "lewis_overton" are smooth-only — they require
-                     l1_lambda == 0 (see the line search notes below) and raise
-                     ValueError otherwise; use "armijo" for L1.
-        curv_eps:    tighten toward 1e-6 if you're seeing ρ blow up, or loosen
-                     toward 1e-10 if you're on a very flat objective and the
-                     guard is rejecting too many pairs.
-        ls_rho:      if Armijo fails, we shrink α <- ρα with ρ ∈ (0.4,0.8), after
-                     "n" backtracks your final step is α^n.
-        ls_c1:       a looser value (1e-3) will terminate line search faster but
-                     might degrade overall convergence; the default value of
-                     1e-4 is convention and emperically robust, the line search
-                     is not very sensitive to this parameter.
-        ls_c2:       Wolfe curvature constant σ, used by "hz" and
-                     "lewis_overton". The default 0.9 is standard for
-                     quasi-Newton; smaller (e.g. 0.1) forces a more exact line
-                     minimization at the cost of more evals.
+    Returns
+    -------
+    Result
+        The optimum, why the solver stopped, and per-iteration diagnostics.
+
+    Notes
+    -----
+    Two things worth knowing before tuning anything (the README covers the rest):
+
+    * ``gtol`` is compared against the **RMS** pseudo-gradient, so it means the
+      same per-component accuracy at any parameter count. If ``fun`` sums over
+      ``n`` samples in float64, scale it by ``sqrt(n)`` to clear the accumulation
+      noise floor — or better, normalize the objective by ``n``.
+    * The Wolfe searches (``"hz"``, ``"lewis_overton"``) are smooth-only and
+      raise ValueError under ``l1_lambda > 0``; use ``"armijo"`` for L1.
     """
-
     p = Params() if params is None else params
-    assert p.l1_lambda >= 0, "invalid L1 lambda"
-
-    if p.line_search not in LINE_SEARCHES:
-        raise ValueError(
-            f"unknown line_search {p.line_search!r}; expected one of {sorted(LINE_SEARCHES)}"
-        )
-    if p.line_search in SMOOTH_ONLY and p.l1_lambda > 0.0:
-        # The Wolfe searches read the slope φ'(α), which the L1 orthant snapping
-        # makes discontinuous, so we restrict them to smooth problems.
-        raise ValueError(f"{p.line_search!r} requires l1_lambda == 0 (use 'armijo' for L1)")
+    p._validate()  # re-check, in case a field was reassigned after construction
 
     x = np.array(x0, dtype=np.float64)
-    l1_mask = np.ones_like(x, dtype=np.bool)
-    if p.l1_mask is not None and p.l1_lambda > 0.0:
+    if x.ndim != 1 or x.size == 0:
+        raise ValueError(f"x0 must be a non-empty 1-D array; got shape {x.shape}")
+
+    # The kernels take a mask of the *penalized* coordinates, the complement of
+    # the exemptions the user lists in `l1_mask`.
+    l1_mask = np.ones(x.size, dtype=bool)
+    if p.l1_mask is not None:
         l1_mask[p.l1_mask] = False
 
+    lam = p.l1_lambda
     line_search = LINE_SEARCHES[p.line_search]
+    secant_history: deque = deque(maxlen=p.m)  # (s, y, 1/sᵀy) triples, oldest first
+    history: list[tuple] = []
+    obj = _Counted(fun)
+    sqrt_dim = np.sqrt(x.size)
 
-    # secant pair history (bounded deques)
-    secant_history = deque(maxlen=p.m)
-
-    f_smooth, g_smooth = fun(x)
-    f_total = _total_objective(f_smooth, x, p.l1_lambda, l1_mask)
-    pg = _pseudo_gradient(g_smooth, x, p.l1_lambda, l1_mask)
-
-    # Convergence: compare the RMS pseudo-gradient against gtol so the
-    # threshold is invariant to parameter count. (scipy's L-BFGS-B uses
-    # inf-norm for the same reason.)
-    sqrt_dim = np.sqrt(len(pg))
+    f_smooth, g_smooth = obj(x)
+    f_total = _total_objective(f_smooth, x, lam, l1_mask)
+    pg = _pseudo_gradient(g_smooth, x, lam, l1_mask)
     pg_norm = _norm2(pg)
     rms_pg = pg_norm / sqrt_dim
-    history = []
 
-    for _ in range(1, p.max_iter + 1):
+    def result(reason: str, converged: bool) -> Result:
+        """Snapshot the current state. Reads the enclosing locals as they stand."""
+        return Result(
+            theta=x,
+            loss=f_total,
+            rms_grad=rms_pg,
+            converged=converged,
+            reason=reason,
+            nit=len(history),
+            nfev=obj.n,
+            history=history,
+        )
+
+    def no_progress(hard_reason: str) -> Result:
+        """
+        Classify a failure to move. A gradient already near ``gtol`` means the
+        objective is flat to roundoff and no measurable decrease exists — a benign
+        stall at the optimum, reported as ``precision_loss`` and converged. A
+        gradient still large means ``hard_reason``, a real failure. We know
+        ``rms_pg >= gtol`` here, so the band is how far above ``gtol`` we stopped.
+        """
+        soft = rms_pg < p.ls_stall_factor * p.gtol
+        return result("precision_loss" if soft else hard_reason, soft)
+
+    nit = 0
+    while True:
+        # Convergence is tested on the RMS pseudo-gradient so `gtol` is invariant
+        # to parameter count (scipy's L-BFGS-B uses the inf-norm for the same
+        # reason). Tested before the iteration budget, so an already-optimal x0
+        # reports "gtol" even with max_iter == 0.
         if rms_pg < p.gtol:
-            return Result(x, f_total, rms_pg, True, "gtol", history)
+            return result("gtol", True)
+        if nit >= p.max_iter:
+            return result("max_iter", False)
+        nit += 1
 
-        # search direction via L-BFGS two-loop recursion
+        # search direction via the L-BFGS two-loop recursion
         d = _two_loop_recursion(pg, secant_history)
 
         # orthant projection: zero out components where d and -pg disagree
-        if p.l1_lambda > 0.0:
+        if lam > 0.0:
             d[(d * pg >= 0.0) & l1_mask] = 0.0
 
-        if np.all(d == 0.0):
-            return Result(x, f_total, rms_pg, rms_pg < p.gtol, "no_direction", history)
+        if not d.any():
+            return result("no_direction", False)
 
-        # initial step size for the line search
-        alpha = p.ls_alpha0
-        if len(secant_history) == 0 and pg_norm > 0.0:
-            alpha = 1.0 / pg_norm  # scale first step
-
-        dg = pg.dot(d)  # directional derivative (must be negative)
-        if dg >= 0.0:
+        # `not (dg < 0)` rather than `dg >= 0` so a NaN slope is rejected too
+        # instead of falling through into the line search.
+        dg = float(pg.dot(d))
+        if not (dg < 0.0):
             secant_history.clear()  # reset to steepest descent
             d = -pg
-            dg = pg.dot(d)
-            alpha = 1.0 / pg_norm if pg_norm > 0.0 else 1.0
+            dg = -pg_norm * pg_norm
 
-        # All three searches share one interface (see lbfgs._linesearch), so
-        # there is nothing to branch on here.
+        # Scale the very first step (and any step right after a reset) by 1/||pg||;
+        # after that the L-BFGS direction is already unit-Newton-scaled.
+        alpha = 1.0 / pg_norm if not secant_history and pg_norm > 0.0 else p.ls_alpha0
+
         x_new, f_new_smooth, g_new_smooth, f_new_total, _, ls_iter, ok = line_search(
-            fun, x, d, f_smooth, f_total, g_smooth, dg, alpha, p, l1_mask
+            obj, x, d, f_smooth, f_total, g_smooth, dg, alpha, p, l1_mask
         )
-
         if not ok:
-            # The line search found no sufficient-decrease step. Distinguish a
-            # benign stall at the optimum — the gradient is already near gtol, so
-            # the objective is flat to roundoff and no measurable decrease exists
-            # — from a genuine failure (gradient still large: bad direction,
-            # wrong analytic gradient, or a noisy/non-smooth objective). We know
-            # rms_pg >= gtol here (the gtol check above passed), so the band is
-            # how far above gtol we stalled.
-            stalled = rms_pg < p.ls_stall_factor * p.gtol
-            reason = "precision_loss" if stalled else "ls_failed"
-            return Result(x, f_total, rms_pg, stalled, reason, history)
+            return no_progress("ls_failed")
 
         # secant pair update (smooth gradients, not pseudo-gradients)
         s = x_new - x
         y = g_new_smooth - g_smooth
-        sy = s.dot(y)  # these should be comfortably positive
+        sy = float(s.dot(y))  # this should be comfortably positive
         s_norm = _norm2(s)
         y_norm = _norm2(y)
+
+        if s_norm == 0.0:
+            # x + α·d == x in float, so the next iteration would be bit-identical
+            # and the loop could only spin. Report it the same way as an outright
+            # line-search failure.
+            return no_progress("ls_failed")
 
         # Cautious-update guard: skip the secant pair unless yᵀs is positive
         # enough. With Armijo, ||y|| can be tiny (no curvature condition), so we
         # only check the weak yᵀs > curv_eps·sᵀs floor rather than the stronger
-        # cosine guard, which could reject good pairs or admit corrupt ones.
-        # The Hager-Zhang search does satisfy the Wolfe curvature condition, so
-        # there yᵀs is guaranteed comfortably positive and this rarely trips.
-        curv_ok = False
-        if sy > p.curv_eps * s.dot(s):
+        # cosine guard, which could reject good pairs or admit corrupt ones. The
+        # Wolfe searches do satisfy the curvature condition, so there yᵀs is
+        # guaranteed comfortably positive and this rarely trips.
+        curv_ok = sy > p.curv_eps * s_norm * s_norm
+        if curv_ok:
             secant_history.append((s, y, 1.0 / sy))
-            curv_ok = True
 
         # advance
         x = x_new
         f_smooth = f_new_smooth
-        g_smooth = g_new_smooth
         f_total = f_new_total
-        pg = _pseudo_gradient(g_smooth, x, p.l1_lambda, l1_mask)
+        g_smooth = g_new_smooth
+        pg = _pseudo_gradient(g_smooth, x, lam, l1_mask)
         pg_norm = _norm2(pg)
         rms_pg = pg_norm / sqrt_dim
 
         history.append((f_total, rms_pg, ls_iter, sy, s_norm, y_norm, curv_ok))
-
-    return Result(x, f_total, rms_pg, False, "max_iter", history)

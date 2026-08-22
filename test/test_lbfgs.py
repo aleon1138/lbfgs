@@ -9,7 +9,7 @@ from collections import deque
 
 import numpy as np
 
-from lbfgs import Params, minimize
+from lbfgs import Params, Result, minimize
 from lbfgs import _core, _kernels, _linesearch
 
 
@@ -315,6 +315,39 @@ class TestLewisOverton(unittest.TestCase):
         self.assertEqual(result.reason, "gtol")
         self.assertTrue(np.all(result.history.s_dot_y > 0.0))
         self.assertTrue(np.all(result.history.curv_ok))
+
+    def test_lo_is_not_roundoff_tolerant_but_hz_is(self):
+        """The headline difference between the two Wolfe searches.
+
+        LO's sufficient-decrease gate is a test on the function value, so once
+        phi(alpha) - phi(0) shrinks into the rounding error LO can no longer verify
+        a decrease and gives up. HZ's approximate-Wolfe condition is slope-based
+        and keeps going. On a kappa ~ 1e4 quadratic the two separate by three
+        orders of magnitude, and tightening gtol does not move LO at all — it is
+        at its floor, not merely short of the target.
+        """
+        fn, _ = _ill_conditioned_quad()
+        floors = {}
+        for ls in ("armijo", "lewis_overton", "hz"):
+            for gtol in (1e-7, 1e-9):
+                r = minimize(fn, np.zeros(30), Params(line_search=ls, max_iter=3000, gtol=gtol))
+                floors[ls, gtol] = r
+                if ls == "hz":  # slope-based: reaches whatever we ask for
+                    self.assertEqual(r.reason, "gtol", f"hz should reach gtol={gtol}")
+                else:
+                    # Value-based: bottoms out well above the target. Which reason
+                    # it reports depends on where the driver gives up (ls_failed
+                    # once the search can no longer move, max_iter if it grinds on
+                    # taking unproductive steps first); the property under test is
+                    # that it does not get there.
+                    self.assertFalse(r.converged, f"{ls} should not converge at gtol={gtol}")
+                    self.assertGreater(r.rms_grad, 10 * gtol)
+
+        # ...and the value-based searches stop at the same place regardless of the
+        # tolerance asked for, which is what "hitting the noise floor" means.
+        for ls in ("armijo", "lewis_overton"):
+            self.assertAlmostEqual(floors[ls, 1e-7].rms_grad, floors[ls, 1e-9].rms_grad, places=12)
+        self.assertLess(floors["hz", 1e-9].rms_grad, floors["lewis_overton", 1e-9].rms_grad / 100)
 
     def test_lo_matches_armijo_logistic(self):
         """On a smooth logistic loss, LO and Armijo reach the same minimum."""
@@ -676,3 +709,267 @@ class TestExhaustedBudget(unittest.TestCase):
                     out = self._run(name, Params(line_search=name, ls_max_iter=budget))
                     self.assertEqual(len(out), 7)
                     self.assertIn(out[-1], (True, False))
+
+
+class TestParamsValidation(unittest.TestCase):
+    """`Params` rejects unusable configurations at construction time, so a bad
+    knob surfaces where it was set rather than deep inside a line search."""
+
+    def test_rejects_bad_values(self):
+        for kwargs in (
+            {"m": 0},
+            {"max_iter": -1},
+            {"l1_lambda": -0.5},
+            {"ls_max_iter": 0},
+            {"ls_rho": 0.0},
+            {"ls_rho": 1.0},
+            {"line_search": "newton"},
+            {"line_search": "hz", "l1_lambda": 0.5},
+            {"line_search": "lewis_overton", "l1_lambda": 0.5},
+            {"line_search": "hz", "ls_c2": 0.05},  # needs _HZ_DELTA < c2 < 1
+            {"line_search": "hz", "ls_c2": 1.0},
+            {"line_search": "lewis_overton", "ls_c1": 0.95, "ls_c2": 0.9},  # needs c1 < c2
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValueError):
+                    Params(**kwargs)
+
+    def test_accepts_defaults_and_valid_combinations(self):
+        Params()
+        for ls in ("armijo", "hz", "lewis_overton"):
+            Params(line_search=ls)
+        Params(line_search="armijo", l1_lambda=1.0, l1_mask=[0])
+
+    def test_minimize_revalidates_after_mutation(self):
+        """`Params` is a plain mutable dataclass, so `minimize` checks again."""
+        p = Params()
+        p.line_search = "nonsense"
+        with self.assertRaises(ValueError):
+            minimize(lambda x: (0.5 * x.dot(x), x.copy()), np.ones(3), p)
+
+    def test_rejects_bad_x0(self):
+        fn = lambda x: (0.5 * x.dot(x), x.copy())  # noqa: E731
+        for x0 in (np.zeros(0), np.zeros((3, 2)), np.zeros((2, 2, 2))):
+            with self.subTest(shape=x0.shape):
+                with self.assertRaises(ValueError):
+                    minimize(fn, x0)
+
+    def test_x0_is_copied_not_mutated(self):
+        x0 = np.array([3.0, -2.0])
+        before = x0.copy()
+        minimize(lambda x: (0.5 * x.dot(x), x.copy()), x0)
+        np.testing.assert_array_equal(x0, before)
+
+    def test_integer_x0_is_promoted(self):
+        """An int array must not silently truncate every step to zero."""
+        r = minimize(lambda x: (0.5 * x.dot(x), x.copy()), np.array([3, -4]))
+        self.assertEqual(r.theta.dtype, np.float64)
+        self.assertEqual(r.reason, "gtol")
+
+
+class TestResultReporting(unittest.TestCase):
+    """The termination reasons and the diagnostic bookkeeping."""
+
+    def _bowl(self):
+        return lambda x: (0.5 * float(x.dot(x)), x.copy())
+
+    def test_counters_agree_with_history(self):
+        n_calls = [0]
+
+        def counted(x):
+            n_calls[0] += 1
+            return 0.5 * float(x.dot(x)), x.copy()
+
+        r = minimize(counted, np.array([5.0, -3.0, 1.0]))
+        self.assertEqual(r.nit, len(r.history))
+        self.assertEqual(r.nfev, n_calls[0])
+        self.assertGreaterEqual(r.nfev, r.nit)  # at least one evaluation per iteration
+
+    def test_rms_grad_is_an_rms_not_a_norm(self):
+        """`rms_grad` must be ||pg||/sqrt(dim), which is what `gtol` is compared
+        against — the whole point being that `gtol` is dimension-invariant."""
+        # Same per-component gradient at two very different dimensions: an RMS
+        # reports the same number, a raw L2 norm would not.
+        results = []
+        for n in (4, 400):
+            r = minimize(
+                lambda x: (float(x.sum()), np.full_like(x, 0.25)), np.zeros(n), Params(max_iter=0)
+            )
+            results.append(r.rms_grad)
+        self.assertAlmostEqual(results[0], 0.25, places=12)
+        self.assertAlmostEqual(results[1], 0.25, places=12)
+        self.assertEqual(r.history.dtype.names[1], "rms_grad")  # history agrees on the name
+
+    def test_gtol_beats_the_iteration_budget(self):
+        """An x0 that is already optimal reports "gtol", even with no budget: the
+        convergence test runs before the iteration count is consulted."""
+        r = minimize(self._bowl(), np.zeros(3), Params(max_iter=0))
+        self.assertEqual(r.reason, "gtol")
+        self.assertTrue(r.converged)
+        self.assertEqual(r.nit, 0)
+        self.assertEqual(len(r.history), 0)
+
+    def test_max_iter(self):
+        r = minimize(self._bowl(), np.full(3, 1e6), Params(max_iter=2, gtol=1e-30))
+        self.assertEqual(r.reason, "max_iter")
+        self.assertFalse(r.converged)
+        self.assertEqual(r.nit, 2)
+
+    def test_no_direction(self):
+        """Under L1 with lambda large enough to zero every coordinate, the orthant
+        projection kills the whole direction."""
+        r = minimize(
+            lambda x: (0.0, np.zeros_like(x)), np.zeros(4), Params(l1_lambda=1.0, gtol=0.0)
+        )
+        self.assertEqual(r.reason, "no_direction")
+        self.assertFalse(r.converged)
+
+    def test_precision_loss_is_a_soft_success(self):
+        """A line-search failure with the gradient already inside
+        ls_stall_factor*gtol is a benign stall, reported as converged."""
+        fn, _ = _ill_conditioned_quad()
+        # gtol far below the value-based noise floor -> lewis_overton cannot verify
+        # a decrease; a generous stall factor puts the failure in the benign band.
+        tight = minimize(
+            fn, np.zeros(30), Params(line_search="lewis_overton", gtol=1e-9, max_iter=3000)
+        )
+        self.assertEqual(tight.reason, "ls_failed")
+        self.assertFalse(tight.converged)
+
+        lenient = minimize(
+            fn,
+            np.zeros(30),
+            Params(line_search="lewis_overton", gtol=1e-9, max_iter=3000, ls_stall_factor=1e6),
+        )
+        self.assertEqual(lenient.reason, "precision_loss")
+        self.assertTrue(lenient.converged)
+        # Same stopping point either way; only the verdict on it differs.
+        np.testing.assert_array_equal(tight.theta, lenient.theta)
+
+    def test_ls_failed_on_a_wrong_gradient(self):
+        """The classic user error — a gradient that does not match the objective —
+        must surface as ls_failed, not silent nonsense."""
+        r = minimize(lambda x: (0.5 * float(x.dot(x)), -x), np.array([2.0, 1.0]))
+        self.assertEqual(r.reason, "ls_failed")
+        self.assertFalse(r.converged)
+
+    def test_history_is_a_recarray_with_named_fields(self):
+        r = minimize(self._bowl(), np.array([4.0, 3.0]), Params(gtol=1e-10))
+        self.assertIsInstance(r.history, np.recarray)
+        self.assertEqual(list(r.history.dtype.names), [n for n, _ in Result.dtype])
+        self.assertTrue(np.all(np.diff(r.history.loss) <= 0.0))  # loss never increases
+        self.assertTrue(np.all(r.history.s_norm > 0.0))
+        self.assertTrue(np.all(r.history.ls_iter >= 1))
+
+
+class TestL1Mask(unittest.TestCase):
+    def test_masked_coordinates_are_unpenalized(self):
+        rng = np.random.default_rng(5)
+        n, p_dim, lam = 150, 30, 1.5
+        X = rng.standard_normal((n, p_dim))
+        w = rng.standard_normal(p_dim) * (rng.random(p_dim) < 0.3)
+        y = X @ w + 0.1 * rng.standard_normal(n)
+        XtX, Xty = X.T @ X, X.T @ y
+        fn = lambda v: (0.5 * float(np.sum((X @ v - y) ** 2)), XtX @ v - Xty)  # noqa: E731
+
+        exempt = [0, 1]
+        r = minimize(fn, np.zeros(p_dim), Params(l1_lambda=lam, l1_mask=exempt, gtol=1e-12))
+        g = XtX @ r.theta - Xty
+
+        # Exempt coordinates see no penalty, so they must be plain stationary.
+        np.testing.assert_allclose(g[exempt], 0.0, atol=1e-5)
+        # Penalized coordinates obey the L1 subgradient bound |g_i| <= lambda.
+        penalized = [i for i in range(p_dim) if i not in exempt]
+        self.assertLessEqual(np.abs(g[penalized]).max(), lam + 1e-6)
+
+    def test_boolean_mask_is_accepted(self):
+        mask = np.zeros(6, dtype=bool)
+        mask[[1, 3]] = True  # exempt coordinates 1 and 3
+        fn = lambda v: (0.5 * float(v.dot(v)) - v.sum(), v - 1.0)  # noqa: E731
+        by_bool = minimize(fn, np.zeros(6), Params(l1_lambda=0.5, l1_mask=mask, gtol=1e-12))
+        by_index = minimize(fn, np.zeros(6), Params(l1_lambda=0.5, l1_mask=[1, 3], gtol=1e-12))
+        np.testing.assert_allclose(by_bool.theta, by_index.theta, atol=1e-12)
+        # exempt coords land on the unpenalized optimum, penalized ones are shrunk
+        np.testing.assert_allclose(by_bool.theta[[1, 3]], 1.0, atol=1e-8)
+        np.testing.assert_allclose(by_bool.theta[[0, 2, 4, 5]], 0.5, atol=1e-8)
+
+    def test_out_of_range_mask_index_is_an_error(self):
+        with self.assertRaises(IndexError):
+            minimize(
+                lambda v: (0.0, np.zeros_like(v)), np.zeros(3), Params(l1_lambda=1.0, l1_mask=[7])
+            )
+
+
+class TestOwlQnOptimality(unittest.TestCase):
+    """OWL-QN must land on the true LASSO optimum, not merely somewhere sparse."""
+
+    @staticmethod
+    def _fista(X, y, lam, n_iter=100000):
+        """Independent reference solver: accelerated proximal gradient. Shares no
+        code with the package, so agreement is real evidence."""
+        L = float(np.linalg.eigvalsh(X.T @ X).max())
+        w = np.zeros(X.shape[1])
+        z, t = w.copy(), 1.0
+        for _ in range(n_iter):
+            u = z - X.T @ (X @ z - y) / L
+            w_new = np.sign(u) * np.maximum(np.abs(u) - lam / L, 0.0)  # prox of the L1 term
+            t_new = (1 + np.sqrt(1 + 4 * t * t)) / 2
+            z = w_new + ((t - 1) / t_new) * (w_new - w)
+            if np.linalg.norm(w_new - w) < 1e-15 * max(1.0, np.linalg.norm(w)):
+                return w_new
+            w, t = w_new, t_new
+        return w
+
+    def _problem(self, rng, n=120, p_dim=25, nnz=5):
+        X = rng.standard_normal((n, p_dim))
+        w = np.zeros(p_dim)
+        w[rng.choice(p_dim, nnz, replace=False)] = rng.standard_normal(nnz) * 2
+        y = X @ w + 0.1 * rng.standard_normal(n)
+        return X, y
+
+    def test_matches_an_independent_lasso_solver(self):
+        rng = np.random.default_rng(7)
+        for lam in (0.5, 2.0, 10.0):
+            with self.subTest(lam=lam):
+                X, y = self._problem(rng)
+                XtX, Xty = X.T @ X, X.T @ y
+                r = minimize(
+                    lambda w: (0.5 * float(np.sum((X @ w - y) ** 2)), XtX @ w - Xty),
+                    np.zeros(X.shape[1]),
+                    Params(l1_lambda=lam, max_iter=5000, gtol=1e-11),
+                )
+                w_ref = self._fista(X, y, lam)
+                obj = lambda w: 0.5 * np.sum((X @ w - y) ** 2) + lam * np.abs(w).sum()  # noqa: E731
+                # never worse than the reference, and at the same point
+                self.assertLessEqual(obj(r.theta), obj(w_ref) + 1e-9 * abs(obj(w_ref)))
+                np.testing.assert_allclose(r.theta, w_ref, atol=1e-5)
+
+    def test_satisfies_the_kkt_conditions(self):
+        """At the L1 optimum: g_i = -lambda*sign(w_i) on the support, and
+        |g_i| <= lambda off it."""
+        rng = np.random.default_rng(8)
+        lam = 1.5
+        X, y = self._problem(rng, n=150, p_dim=30, nnz=9)
+        XtX, Xty = X.T @ X, X.T @ y
+        r = minimize(
+            lambda w: (0.5 * float(np.sum((X @ w - y) ** 2)), XtX @ w - Xty),
+            np.zeros(X.shape[1]),
+            Params(l1_lambda=lam, max_iter=5000, gtol=1e-12),
+        )
+        g = XtX @ r.theta - Xty
+        support = r.theta != 0.0
+        self.assertTrue(support.any() and not support.all(), "need a mix to test both branches")
+        np.testing.assert_allclose(g[support], -lam * np.sign(r.theta[support]), atol=1e-6)
+        self.assertLessEqual(np.abs(g[~support]).max(), lam + 1e-6)
+
+    def test_coefficients_reach_exactly_zero(self):
+        """The point of the orthant projection: sparsity, not just small values."""
+        rng = np.random.default_rng(9)
+        X, y = self._problem(rng, nnz=3)
+        XtX, Xty = X.T @ X, X.T @ y
+        r = minimize(
+            lambda w: (0.5 * float(np.sum((X @ w - y) ** 2)), XtX @ w - Xty),
+            np.zeros(X.shape[1]),
+            Params(l1_lambda=20.0, max_iter=5000, gtol=1e-10),
+        )
+        self.assertGreater(np.sum(r.theta == 0.0), X.shape[1] // 2)
