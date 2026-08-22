@@ -1,5 +1,5 @@
 """
-lbfgs — a small, pure-Python L-BFGS optimizer.
+lbfgs — a small L-BFGS optimizer, pure Python with a few numba kernels.
 
 Two things this gives you that the SciPy optimizers don't:
 
@@ -13,18 +13,23 @@ Two things this gives you that the SciPy optimizers don't:
 Single entry point::
 
     import lbfgs
-    res = lbfgs.minimize(fun, x0)                               # plain L-BFGS
-    res = lbfgs.minimize(fun, x0, lbfgs.Params(l1_lambda=0.1))  # OWL-QN (L1)
+    res = lbfgs.minimize(fun, x0)                                  # plain L-BFGS
+    res = lbfgs.minimize(fun, x0, lbfgs.Params(l1_lambda=0.1))     # OWL-QN (L1)
     res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hz"))  # Hager-Zhang
-    res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="lewis_overton"))  # weak Wolfe
 
-where ``fun(x) -> (f, grad)`` returns the *smooth* objective and gradient; the
-L1 term, if any, is added internally. See ``Result`` for the optimum and a
-per-iteration diagnostic history.
+where ``fun(x) -> (f, grad)`` returns the *smooth* objective and gradient; the L1
+term, if any, is added internally. See :class:`Result` for the optimum and a
+per-iteration diagnostic history, and the README for the rationale, tuning
+guidance, and a troubleshooting checklist.
 """
 
-from ._core import minimize, Params, Result
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = "0.2.0"
+from ._core import Params, Result, minimize
+
+try:
+    __version__ = version("lbfgs")
+except PackageNotFoundError:  # running from a source tree that was never installed
+    __version__ = "0.0.0.dev0"
 
 __all__ = ["minimize", "Params", "Result", "__version__"]

@@ -1,7 +1,7 @@
 # lbfgs
 
-A small, pure-Python L-BFGS optimizer with two features the SciPy optimizers
-don't provide:
+A small L-BFGS optimizer — pure Python, with a few numba kernels for the
+element-wise inner loops — offering two features the SciPy optimizers don't:
 
 * **OWL-QN** — L1-regularized quasi-Newton (sparse / LASSO-style fits).
 * **Hager-Zhang** approximate-Wolfe line search — roundoff-tolerant on flat /
@@ -77,9 +77,12 @@ guarantees the curvature condition. Two things follow:
   value-based Wolfe search gives up — for example, the Student-t
   degrees-of-freedom $\nu$ parameter, a nearly flat direction where backtracking
   Armijo crawls.
-* Because the curvature condition actually holds, every L-BFGS secant pair has
-  $s^\top y > 0$, so the inverse-Hessian approximation stays trustworthy.
+* Because the curvature condition actually holds, the secant pairs it accepts
+  have $s^\top y > 0$, so the inverse-Hessian approximation stays trustworthy.
   Backtracking Armijo can't promise that (see the troubleshooting notes below).
+  The one gap: if a search exhausts `ls_max_iter` without finding a Wolfe point
+  it salvages the best merely-sufficient-decrease step, which carries no
+  curvature guarantee — that is what the `curv_eps` guard is there to screen.
 
 SciPy has no Hager-Zhang line search. It costs the same single `(f, g)`
 evaluation per trial that backtracking already pays.
@@ -88,9 +91,10 @@ evaluation per trial that backtracking already pays.
 res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hz"))
 ```
 
-Note that we can only use `"hz"` in smooth-only optimizations. If we set `l1_lambda > 0` 
-the orthant projection snaps variables to zero mid-step, making the loss surface non-smooth. 
-This combination will raise `ValueError`.
+`"hz"` is smooth-only. With `l1_lambda > 0` the orthant projection snaps
+variables to zero mid-step, putting a kink in the loss surface wherever a
+coordinate crosses zero — so the slope the search reads is no longer meaningful.
+That combination raises `ValueError`; use `"armijo"` for L1.
 
 ### 3. Instrumentation
 
@@ -101,7 +105,7 @@ troubleshooting checklist).
 
 ## Installation
 
-Pure Python; the only dependencies are `numpy` and `numba`:
+No compiled extension to build; the only dependencies are `numpy` and `numba`:
 
 ```bash
 pip install -e .
@@ -129,8 +133,13 @@ pip install -e .
 | `ls_c1`       | `1e-4`     | Armijo sufficient-decrease constant |
 | `ls_c2`       | `0.9`      | Wolfe curvature constant $\sigma$ (Hager-Zhang and Lewis-Overton) |
 | `ls_max_iter` | `40`       | max line-search iterations |
+| `ls_stall_factor` | `10.0` | a line-search failure with `rms_grad` $<$ `factor`$\cdot$`gtol` is a benign stall, not an error |
 | `curv_eps`    | `1e-12`    | minimum $y^\top s$ to accept a secant pair |
-| `l1_mask`     | `None`     | coordinate indices exempt from the L1 penalty |
+| `l1_mask`     | `None`     | coordinate indices (or a boolean mask) exempt from the L1 penalty |
+
+`Params` validates itself on construction, so an impossible combination — an
+unknown `line_search`, a Wolfe search with `l1_lambda > 0`, `ls_c1 >= ls_c2` —
+raises `ValueError` where you set it rather than deep inside a line search.
 
 ### `Result`
 
@@ -138,9 +147,11 @@ pip install -e .
 | :---------- | :------ |
 | `theta`     | the solution vector |
 | `loss`      | final total objective (smooth + L1) |
-| `grad_norm` | final RMS pseudo-gradient |
+| `rms_grad`  | final RMS pseudo-gradient — the quantity compared against `gtol` |
 | `converged` | `True` on `gtol`, or on `precision_loss` (a benign stall at the optimum) |
 | `reason`    | `"gtol"`, `"max_iter"`, `"precision_loss"`, `"ls_failed"`, or `"no_direction"` |
+| `nit`       | iterations completed (always `len(history)`) |
+| `nfev`      | calls made to `fun`, line-search trials included |
 | `history`   | per-iteration recarray: `loss`, `rms_grad`, `ls_iter`, `s_dot_y`, `s_norm`, `y_norm`, `curv_ok` |
 
 ## Convergence: the RMS pseudo-gradient
@@ -180,9 +191,9 @@ tolerance, and implementation complexity:
 
 | line search | guarantees curvature? | roundoff-tolerant? | complexity |
 | :--- | :--- | :--- | :--- |
-| Armijo (`"armijo"`) | ❌ | n/a (value-based test) | tiny |
-| Lewis-Overton (`"lewis_overton"`) | ✅ weak Wolfe | ❌ (value-based Armijo gate) | small (~30 lines) |
-| Hager-Zhang (`"hz"`) | ✅ approximate Wolfe | ✅ | large (~145 lines) |
+| Armijo (`"armijo"`) | ❌ | ❌ (value-based test) | ~20 lines |
+| Lewis-Overton (`"lewis_overton"`) | ✅ weak Wolfe | ❌ (value-based Armijo gate) | ~50 lines |
+| Hager-Zhang (`"hz"`) | ✅ approximate Wolfe | ✅ | ~135 lines |
 
 * **`"armijo"`** (default, backtracking) checks sufficient decrease only. It
   works for every problem, including L1/OWL-QN — the only one that does — but
@@ -191,10 +202,12 @@ tolerance, and implementation complexity:
 * **`"lewis_overton"`** (Lewis & Overton, 2013) adds the curvature condition with
   a textbook bracket-and-bisect: keep a low/high bracket, bisect on overshoot,
   double the step on undershoot, stop once both weak-Wolfe conditions hold.
-  Because curvature holds, every secant pair has $s^\top y > 0$. It is far simpler
-  than Hager-Zhang, but its sufficient-decrease gate is still value-based, so it
-  is **not** roundoff-tolerant — near a flat optimum it stalls just like any
-  value-based Wolfe search.
+  Because curvature holds, the accepted pairs have $s^\top y > 0$. It is far
+  simpler than Hager-Zhang, but its sufficient-decrease gate is still
+  value-based, so it is **not** roundoff-tolerant — near a flat optimum it stalls
+  just like any value-based Wolfe search. On a $\kappa \approx 10^4$ quadratic it
+  bottoms out around `rms_grad` $\approx 10^{-6}$ no matter how small a `gtol`
+  you ask for, where `"hz"` goes on to reach $10^{-9}$.
 * **`"hz"`** (Hager-Zhang, approximate Wolfe) also guarantees curvature *and*
   stays sound in the float-roundoff regime near a flat optimum (described above),
   at the cost of more machinery.
@@ -246,16 +259,22 @@ The implementation is pure Python (numpy plus a few numba kernels).
 `bench/profile_lbfgs.py` measures where the time goes; the numbers below are
 illustrative (dev machine, best-of-5):
 
-| problem            | wall    | iters | `fun` / optimizer |
-| :----------------- | ------: | ----: | :---------------- |
-| quadratic n=100    | 3.7 ms  |   142 | 11% / 89%         |
-| quadratic n=500    | 21 ms   |   339 | 55% / 45%         |
-| lasso 20000×2000   | 4.7 ms  |     8 | 90% / 10%         |
-| cheap-highdim n=8000 | 2.3 ms |    20 | 9% / 91%          |
+| problem                | wall    | iters | `fun` / optimizer |
+| :--------------------- | ------: | ----: | :---------------- |
+| quadratic n=100        | 8.3 ms  |   142 | 9% / 91%          |
+| quadratic n=500        | 46 ms   |   340 | 46% / 54%         |
+| lasso 5000×500         | 2.8 ms  |    10 | 70% / 30%         |
+| lasso 20000×2000       | 14 ms   |     8 | 86% / 14%         |
+| cheap-highdim n=8000   | 5.2 ms  |    21 | 12% / 88%         |
+
+(i7-7820X, numpy 2.4 / numba 0.65, best-of-9. Absolute times are
+machine-dependent — the `fun`/optimizer split is the part worth reading.)
 
 For realistic problems, where the gradient is a genuine matvec, run costs are
-dominated by the gradient evaluation (`fun`). The optimizer's own overhead is 
-negligible. If we ever decide to spend some time on thins, the known wins are:
+dominated by the gradient evaluation (`fun`) and the optimizer's own overhead is
+negligible. Where it is *not* negligible — a cheap `fun` in high dimensions —
+`_two_loop_recursion` is the top entry in the profile. If it ever becomes worth
+optimizing, the known wins are:
 
 * Store the `s/y` history as one contiguous 2D buffer instead of a deque of
   separately allocated vectors. This is the biggest single win: it turns
@@ -270,12 +289,16 @@ negligible. If we ever decide to spend some time on thins, the known wins are:
 ## Testing
 
 ```bash
-# run unit tests
-pytest test/ -v
-
-# run profiling tests
-python bench/profile_lbfgs.py
+pytest                      # unit tests (pyproject points pytest at ./test)
+python bench/profile_lbfgs.py   # wall-clock table + cProfile breakdown
+ruff check . && ruff format --check .
 ```
+
+Besides the end-to-end solves, the suite pins the numerics against independent
+references: the pseudo-gradient against a branch-by-branch transcription of
+Andrew & Gao, the two-loop recursion against an explicitly formed dense
+inverse-Hessian, and the OWL-QN optimum against a FISTA proximal-gradient solver
+plus the LASSO KKT conditions.
 
 ## References
 
