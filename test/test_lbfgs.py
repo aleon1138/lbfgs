@@ -143,8 +143,8 @@ def _weak_wolfe_holds(loss_fn, x, d, alpha, p):
 # The smooth-only (Wolfe) searches, each paired with the checker for the
 # conditions it promises: name -> (line search, holds(loss_fn, x, d, alpha, p)).
 _WOLFE = {
-    "hz": (_linesearch._line_search_hz, _approx_wolfe_holds),
-    "lewis_overton": (_linesearch._line_search_lewis_overton, _weak_wolfe_holds),
+    "lewis-overton": (_linesearch._line_search_lewis_overton, _weak_wolfe_holds),
+    "hager-zhang": (_linesearch._line_search_hager_zhang, _approx_wolfe_holds),
 }
 assert set(_WOLFE) == set(_linesearch.SMOOTH_ONLY)
 
@@ -184,10 +184,51 @@ class TestMinimize(unittest.TestCase):
         accuracy = np.mean((X @ r.theta > 0.0) == y)
         self.assertGreater(accuracy, 0.90)
 
+    def test_args_are_forwarded_to_fun(self):
+        """``args`` reach ``fun`` as trailing positional arguments on every
+        evaluation, line-search trials included, as in SciPy."""
+
+        def quad(x, A, b):
+            return 0.5 * x.dot(A @ x) - b.dot(x), A @ x - b
+
+        rng = np.random.default_rng(7)
+        M = rng.standard_normal((6, 6))
+        A, b = M.T @ M + np.eye(6), rng.standard_normal(6)
+
+        r = minimize(quad, np.zeros(6), args=(A, b))
+        self.assertEqual(r.reason, "gtol")
+        np.testing.assert_allclose(r.theta, np.linalg.solve(A, b), atol=1e-5)
+
+        # Same path as binding the data in a closure.
+        closed = minimize(lambda x: quad(x, A, b), np.zeros(6))
+        np.testing.assert_array_equal(r.theta, closed.theta)
+        self.assertEqual(r.nfev, closed.nfev)
+
+        # Every call sees the extra arguments, not just the driver's own.
+        seen = []
+
+        def spy(x, tag, A, b):
+            seen.append(tag)
+            return quad(x, A, b)
+
+        r_spy = minimize(spy, np.zeros(6), Params(line_search="lo"), args=("t", A, b))
+        self.assertEqual(seen, ["t"] * r_spy.nfev)
+        self.assertGreater(r_spy.nfev, 1)
+
+    def test_lone_arg_need_not_be_a_tuple(self):
+        """SciPy wraps a single non-tuple ``args`` value; so do we."""
+
+        def scaled_bowl(x, scale):
+            return scale * 0.5 * float(x.dot(x)), scale * x
+
+        r = minimize(scaled_bowl, np.ones(3), args=2.0)
+        self.assertEqual(r.reason, "gtol")
+        np.testing.assert_allclose(r.theta, 0.0, atol=1e-6)
+
 
 class TestWolfeLineSearches(unittest.TestCase):
-    """The two smooth-only searches, Hager-Zhang ('hz') and Lewis-Overton
-    ('lewis_overton'): what they share, and the roundoff tolerance that
+    """The two smooth-only searches, Lewis-Overton ('lewis-overton') and
+    Hager-Zhang ('hager-zhang'): what they share, and the roundoff tolerance that
     separates them."""
 
     def test_line_search_expands_a_short_step(self):
@@ -219,7 +260,9 @@ class TestWolfeLineSearches(unittest.TestCase):
         # Moderately ill-conditioned quadratic (kappa ~ 1e4), where a weak line
         # search would otherwise admit pairs with marginal curvature.
         fn, _ = _ill_conditioned_quad()
-        result = minimize(fn, np.zeros(30), Params(line_search="hz", max_iter=3000, gtol=1e-6))
+        result = minimize(
+            fn, np.zeros(30), Params(line_search="hager-zhang", max_iter=3000, gtol=1e-6)
+        )
         self.assertEqual(result.reason, "gtol")
         self.assertTrue(np.all(result.history.s_dot_y > 0.0))
         self.assertTrue(np.all(result.history.curv_ok))
@@ -233,7 +276,7 @@ class TestWolfeLineSearches(unittest.TestCase):
         # Same moderately ill-conditioned quadratic (kappa ~ 1e4) as the HZ test.
         fn, _ = _ill_conditioned_quad()
         result = minimize(
-            fn, np.zeros(30), Params(line_search="lewis_overton", max_iter=3000, gtol=1e-6)
+            fn, np.zeros(30), Params(line_search="lewis-overton", max_iter=3000, gtol=1e-6)
         )
         # kappa ~ 1e4 sits right at LO's precision floor (rms_grad ~ 1.2e-6 here),
         # so whether it squeaks under gtol or stalls just above it is a matter of
@@ -257,12 +300,12 @@ class TestWolfeLineSearches(unittest.TestCase):
         """
         fn, _ = _ill_conditioned_quad()
         floors = {}
-        for ls in ("armijo", "lewis_overton", "hz"):
+        for ls in ("armijo", "lewis-overton", "hager-zhang"):
             for gtol in (1e-7, 1e-9):
                 r = minimize(fn, np.zeros(30), Params(line_search=ls, max_iter=3000, gtol=gtol))
                 floors[ls, gtol] = r
-                if ls == "hz":  # slope-based: reaches whatever we ask for
-                    self.assertEqual(r.reason, "gtol", f"hz should reach gtol={gtol}")
+                if ls == "hager-zhang":  # slope-based: reaches whatever we ask for
+                    self.assertEqual(r.reason, "gtol", f"hager-zhang should reach gtol={gtol}")
                 else:
                     # Value-based: bottoms out well above the target. Which reason
                     # it reports depends on where the driver gives up (ls_failed
@@ -274,9 +317,11 @@ class TestWolfeLineSearches(unittest.TestCase):
 
         # ...and the value-based searches stop at the same place regardless of the
         # tolerance asked for, which is what "hitting the noise floor" means.
-        for ls in ("armijo", "lewis_overton"):
+        for ls in ("armijo", "lewis-overton"):
             self.assertAlmostEqual(floors[ls, 1e-7].rms_grad, floors[ls, 1e-9].rms_grad, places=12)
-        self.assertLess(floors["hz", 1e-9].rms_grad, floors["lewis_overton", 1e-9].rms_grad / 100)
+        self.assertLess(
+            floors["hager-zhang", 1e-9].rms_grad, floors["lewis-overton", 1e-9].rms_grad / 100
+        )
 
     def test_match_armijo_on_a_logistic_loss(self):
         """On a smooth logistic loss, each Wolfe search reaches the same minimum
@@ -451,11 +496,13 @@ class TestParamsValidation(unittest.TestCase):
             {"ls_rho": 0.0},
             {"ls_rho": 1.0},
             {"line_search": "newton"},
-            {"line_search": "hz", "l1_lambda": 0.5},
-            {"line_search": "lewis_overton", "l1_lambda": 0.5},
-            {"line_search": "hz", "ls_c2": 0.05},  # needs _HZ_DELTA < c2 < 1
-            {"line_search": "hz", "ls_c2": 1.0},
-            {"line_search": "lewis_overton", "ls_c1": 0.95, "ls_c2": 0.9},  # needs c1 < c2
+            {"line_search": "hager-zhang", "l1_lambda": 0.5},
+            {"line_search": "lewis-overton", "l1_lambda": 0.5},
+            {"line_search": "hager-zhang", "ls_c2": 0.05},  # needs _HZ_DELTA < c2 < 1
+            {"line_search": "hager-zhang", "ls_c2": 1.0},
+            {"line_search": "lewis-overton", "ls_c1": 0.95, "ls_c2": 0.9},  # needs c1 < c2
+            {"line_search": "hz", "l1_lambda": 0.5},  # shorthands are validated like full names
+            {"line_search": "lo", "ls_c1": 0.95, "ls_c2": 0.9},
         ):
             with self.subTest(**kwargs):
                 with self.assertRaises(ValueError):
@@ -467,6 +514,30 @@ class TestParamsValidation(unittest.TestCase):
         p.line_search = "nonsense"
         with self.assertRaises(ValueError):
             minimize(_bowl, np.ones(3), p)
+
+    def test_short_names_mean_the_full_ones(self):
+        """The shorthands "lo" and "hz" are accepted wherever the full name is and
+        select the same search: same validation, same dispatch, same path."""
+        fn, _ = _well_conditioned_quad()
+        self.assertTrue(set(_linesearch.ALIASES.values()) <= set(_linesearch.LINE_SEARCHES))
+        for short, full in sorted(_linesearch.ALIASES.items()):
+            with self.subTest(short=short, full=full):
+                self.assertEqual(_linesearch.canonical_name(short), full)
+                self.assertEqual(_linesearch.canonical_name(full), full)
+                a = minimize(fn, np.zeros(20), Params(line_search=short, gtol=1e-6))
+                b = minimize(fn, np.zeros(20), Params(line_search=full, gtol=1e-6))
+                self.assertEqual(a.reason, "gtol")
+                self.assertEqual(a.reason, b.reason)
+                np.testing.assert_array_equal(a.theta, b.theta)
+                self.assertEqual(a.nfev, b.nfev)
+
+    def test_unknown_name_lists_every_accepted_spelling(self):
+        """The old snake_case spelling is gone, and the error names both the
+        full names and the shorthands so the user can pick either."""
+        with self.assertRaises(ValueError) as cm:
+            Params(line_search="lewis_overton")
+        for name in (*_linesearch.LINE_SEARCHES, *_linesearch.ALIASES):
+            self.assertIn(repr(name), str(cm.exception))
 
     def test_rejects_bad_x0(self):
         for x0 in (np.zeros(0), np.zeros((3, 2)), np.zeros((2, 2, 2))):
@@ -544,10 +615,10 @@ class TestResultReporting(unittest.TestCase):
         """A line-search failure with the gradient already inside
         ls_stall_factor*gtol is a benign stall, reported as converged."""
         fn, _ = _ill_conditioned_quad()
-        # gtol far below the value-based noise floor -> lewis_overton cannot verify
+        # gtol far below the value-based noise floor -> Lewis-Overton cannot verify
         # a decrease; a generous stall factor puts the failure in the benign band.
         tight = minimize(
-            fn, np.zeros(30), Params(line_search="lewis_overton", gtol=1e-9, max_iter=3000)
+            fn, np.zeros(30), Params(line_search="lewis-overton", gtol=1e-9, max_iter=3000)
         )
         self.assertEqual(tight.reason, "ls_failed")
         self.assertFalse(tight.converged)
@@ -555,7 +626,7 @@ class TestResultReporting(unittest.TestCase):
         lenient = minimize(
             fn,
             np.zeros(30),
-            Params(line_search="lewis_overton", gtol=1e-9, max_iter=3000, ls_stall_factor=1e6),
+            Params(line_search="lewis-overton", gtol=1e-9, max_iter=3000, ls_stall_factor=1e6),
         )
         self.assertEqual(lenient.reason, "precision_loss")
         self.assertTrue(lenient.converged)

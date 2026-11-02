@@ -13,20 +13,24 @@ Single entry point: `lbfgs.minimize(fun, x0, params)`.
 import numpy as np
 import lbfgs
 
+
 def fun(x):
     # returns (f, grad) of the smooth objective
     r = A @ x - b
     return 0.5 * r.dot(r), A.T @ r
 
-res = lbfgs.minimize(fun, np.zeros(n))                                  # plain L-BFGS
-res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(l1_lambda=0.1))     # OWL-QN
-res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="hz"))  # Hager-Zhang
-res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="lewis_overton"))  # weak Wolfe
+
+res = lbfgs.minimize(fun, np.zeros(n))  # plain L-BFGS
+res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(l1_lambda=0.1))  # OWL-QN
+res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="lewis-overton"))  # weak Wolfe
+res = lbfgs.minimize(fun, np.zeros(n), lbfgs.Params(line_search="hager-zhang"))  # approximate Wolfe
 print(res.theta, res.loss, res.reason)
 ```
 
 `fun(x)` returns only the smooth objective and gradient; the L1 term, if any,
-is added internally through the pseudo-gradient.
+is added internally through the pseudo-gradient. Extra arguments for `fun` go
+through `args`, as in SciPy: `lbfgs.minimize(fun, x0, args=(A, b))` calls
+`fun(x, A, b)`. `line_search` also takes the shorthands `"lo"` and `"hz"`.
 
 ## Why not just use SciPy?
 
@@ -88,10 +92,11 @@ SciPy has no Hager-Zhang line search. It costs the same single `(f, g)`
 evaluation per trial that backtracking already pays.
 
 ```python
-res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hz"))
+res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hager-zhang"))
 ```
 
-`"hz"` is smooth-only. With `l1_lambda > 0` the orthant projection snaps
+`"hager-zhang"` is smooth-only, and so is `"lewis-overton"` below. With
+`l1_lambda > 0` the orthant projection snaps
 variables to zero mid-step, putting a kink in the loss surface wherever a
 coordinate crosses zero — so the slope the search reads is no longer meaningful.
 That combination raises `ValueError`; use `"armijo"` for L1.
@@ -113,11 +118,13 @@ pip install -e .
 
 ## API
 
-### `minimize(fun, x0, params=None) -> Result`
+### `minimize(fun, x0, params=None, args=()) -> Result`
 
-* `fun(x) -> (f, grad)` — the **smooth** objective value and gradient.
+* `fun(x, *args) -> (f, grad)` — the **smooth** objective value and gradient.
 * `x0` — initial point (copied and cast to float64 internally).
 * `params` — a `Params` instance (defaults used if `None`).
+* `args` — extra arguments forwarded to `fun`, as in `scipy.optimize.minimize`.
+  A lone non-tuple value is wrapped, so `args=A` means `fun(x, A)`.
 
 ### `Params`
 
@@ -127,7 +134,7 @@ pip install -e .
 | `max_iter`    | `800`      | iteration cap |
 | `l1_lambda`   | `0.0`      | L1 weight; `> 0` enables OWL-QN |
 | `gtol`        | `1e-6`     | RMS pseudo-gradient tolerance (see *Convergence*) |
-| `line_search` | `"armijo"` | `"armijo"` (backtracking), `"hz"` (Hager-Zhang), or `"lewis_overton"` (weak Wolfe) |
+| `line_search` | `"armijo"` | `"armijo"` (backtracking), `"lewis-overton"` / `"lo"` (weak Wolfe), or `"hager-zhang"` / `"hz"` (approximate Wolfe) |
 | `ls_alpha0`   | `1.0`      | initial trial step; the first iteration (and the first after a history reset) uses $1/\lVert \mathrm{pg} \rVert$ instead |
 | `ls_rho`      | `0.5`      | Armijo backtracking shrink factor |
 | `ls_c1`       | `1e-4`     | sufficient-decrease constant $c_1$ (Armijo and Lewis-Overton; Hager-Zhang fixes its own at $\delta = 0.1$) |
@@ -139,7 +146,7 @@ pip install -e .
 
 `Params` validates itself on construction, so an impossible combination — an
 unknown `line_search`, a Wolfe search with `l1_lambda > 0`, `ls_c1 >= ls_c2`
-under `"lewis_overton"` — raises `ValueError` where you set it rather than deep
+under `"lewis-overton"` — raises `ValueError` where you set it rather than deep
 inside a line search.
 
 ### `Result`
@@ -187,34 +194,67 @@ $$
 For gradient descent the search direction is $p = -\nabla f(x)$; for L-BFGS it is
 $p = -H\,\nabla f(x)$ with $H$ the inverse-Hessian approximation.
 
-The package offers three, trading off the curvature guarantee, roundoff
-tolerance, and implementation complexity:
+The package offers three. They form a ladder, each rung adding one guarantee to
+the one below it:
 
 | line search | guarantees curvature? | roundoff-tolerant? | complexity |
 | :--- | :--- | :--- | :--- |
 | Armijo (`"armijo"`) | ❌ | ❌ (value-based test) | ~20 lines |
-| Lewis-Overton (`"lewis_overton"`) | ✅ weak Wolfe | ❌ (value-based Armijo gate) | ~50 lines |
-| Hager-Zhang (`"hz"`) | ✅ approximate Wolfe | ✅ | ~135 lines |
+| Lewis-Overton (`"lewis-overton"`, `"lo"`) | ✅ weak Wolfe | ❌ (value-based Armijo gate) | ~50 lines |
+| Hager-Zhang (`"hager-zhang"`, `"hz"`) | ✅ approximate Wolfe | ✅ | ~135 lines |
 
 * **`"armijo"`** (default, backtracking) checks sufficient decrease only. It
   works for every problem, including L1/OWL-QN — the only one that does — but
   gives no curvature guarantee, so secant pairs can carry weak curvature (see the
-  troubleshooting notes).
-* **`"lewis_overton"`** (Lewis & Overton, 2013) adds the curvature condition with
+  troubleshooting notes). It also only ever shrinks the trial step: a unit step
+  that undershoots is taken as is.
+* **`"lewis-overton"`** (Lewis & Overton, 2013) adds the curvature condition with
   a textbook bracket-and-bisect: keep a low/high bracket, bisect on overshoot,
   double the step on undershoot, stop once both weak-Wolfe conditions hold.
-  Because curvature holds, the accepted pairs have $s^\top y > 0$. It is far
-  simpler than Hager-Zhang, but its sufficient-decrease gate is still
+  Because curvature holds, the pairs it certifies have $s^\top y > 0$, and a
+  too-short step is grown instead of taken. The *weak* form is deliberate: it
+  accepts any step past the point where the slope has flattened enough, which is
+  all L-BFGS needs, and unlike a strong-Wolfe search (SciPy's) it does not also
+  insist on landing near the 1-D minimizer. Its sufficient-decrease gate is still
   value-based, so it is **not** roundoff-tolerant — near a flat optimum it stalls
-  just like any value-based Wolfe search. On a $\kappa \approx 10^4$ quadratic it
-  bottoms out around `rms_grad` $\approx 10^{-6}$ no matter how small a `gtol`
-  you ask for, where `"hz"` goes on to reach $10^{-9}$.
-* **`"hz"`** (Hager-Zhang, approximate Wolfe) also guarantees curvature *and*
-  stays sound in the float-roundoff regime near a flat optimum (described above),
-  at the cost of more machinery.
+  at the same place Armijo does.
+* **`"hager-zhang"`** (Hager & Zhang, 2005, approximate Wolfe) also guarantees
+  curvature *and* stays sound in the float-roundoff regime near a flat optimum
+  (described above), at the cost of more machinery.
 
-Both `"hz"` and `"lewis_overton"` are smooth-only and raise `ValueError` under
-`l1_lambda > 0`; use `"armijo"` for L1.
+Both Wolfe searches are smooth-only and raise `ValueError` under
+`l1_lambda > 0`; use `"armijo"` for L1. A trial step costs one `(f, g)`
+evaluation whichever search is in use; `Result.history.ls_iter` counts them.
+
+### Why three?
+
+Hager-Zhang differs from Armijo in two ways at once: it enforces the curvature
+condition, and its decrease test tolerates roundoff. Lewis-Overton has only the
+first, so it is the control that tells the two effects apart. On a
+$\kappa \approx 10^4$ quadratic, Armijo and Lewis-Overton stop at the same
+`rms_grad` $\approx 10^{-6}$ floor however small a `gtol` you ask for, while
+Hager-Zhang goes on to $10^{-9}$. So the floor is the value-based gate, not
+missing curvature — and the test suite pins exactly that comparison.
+Lewis-Overton is also the simplest search with a curvature guarantee, about a
+third the size of Hager-Zhang and readable in one sitting, which makes it the
+reference to fall back on when Hager-Zhang misbehaves: the suite runs the same
+Wolfe-point and convergence checks over both, so a failure in Hager-Zhang alone
+points at its extra machinery.
+
+### Which one?
+
+* **L1 (`l1_lambda > 0`)**: `"armijo"`. It is the only valid choice; the other
+  two raise `ValueError`.
+* **Smooth and well-scaled**: `"armijo"` is fine. The $\gamma$-scaled L-BFGS
+  unit step is accepted on nearly every iteration and already satisfies
+  curvature, so all three searches take the same path.
+* **Smooth, but `curv_ok` is dropping or the iteration count is climbing**:
+  `"lewis-overton"`. Enforced curvature keeps the secant history clean, and the
+  search grows a step the direction under-scaled, at the same `(f, g)` cost per
+  trial as backtracking.
+* **Smooth, and you need digits past the value-based floor** (flat or
+  ill-conditioned directions, `precision_loss` showing up before `gtol`):
+  `"hager-zhang"`.
 
 ## Troubleshooting
 
@@ -238,9 +278,9 @@ the Armijo step can land where the gradient has rotated substantially while
 $y^\top s$ is still positive, and the Hessian approximation slowly drifts. You'll
 see the iteration count climb, convergence stall, and the objective oscillate
 slightly. Reduce `m` so bad pairs age out faster, or, for an unregularized
-problem, switch to a Wolfe line search (`line_search="hz"`, or the simpler
-`"lewis_overton"`) — both enforce the curvature condition, so $y^\top s$ stays
-comfortably positive.
+problem, switch to a Wolfe line search (`line_search="lewis-overton"`, or
+`"hager-zhang"` if you also need digits past the roundoff floor) — both enforce
+the curvature condition, so $y^\top s$ stays comfortably positive.
 
 ### Practical checklist
 

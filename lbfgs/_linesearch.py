@@ -2,25 +2,40 @@
 Line searches for the ``lbfgs`` package.
 
 Three step-length rules with the same job: given a descent direction ``d`` at
-``x``, find a step ``alpha`` the L-BFGS driver can trust.
+``x``, find a step ``alpha`` the L-BFGS driver can trust. They form a ladder,
+each rung adding one guarantee to the one below it:
 
 * **Armijo** (``"armijo"``) backtracks on the *total* (smooth plus L1) objective,
   applying the OWL-QN orthant projection along the way. It is the only rule valid
   under L1. It tests sufficient decrease alone, so it offers no curvature
-  guarantee.
-* **Lewis-Overton** (``"lewis_overton"``) is the textbook *weak Wolfe* search, a
-  bracket-and-bisect that enforces both sufficient decrease and the curvature
-  condition, so every secant pair has ``sᵀy > 0``. Smooth-only. Its
-  sufficient-decrease gate is value-based, so it is not roundoff-tolerant.
-* **Hager-Zhang** (``"hz"``) satisfies the *approximate Wolfe* conditions. Like
-  Lewis-Overton it enforces curvature, and it additionally stays sound in the
-  floating-point roundoff regime near a flat optimum. Smooth-only, and by far the
-  most machinery.
+  guarantee, and it can only shrink the trial step, never grow it.
+* **Lewis-Overton** (``"lewis-overton"``, shorthand ``"lo"``) is the textbook
+  *weak Wolfe* search, a bracket-and-bisect that enforces sufficient decrease
+  *and* the curvature condition, so the secant pairs it certifies have
+  ``sᵀy > 0``. It also grows a trial step that undershoots, which Armijo cannot.
+  Smooth-only. Its sufficient-decrease gate is value-based, so it is not
+  roundoff-tolerant.
+* **Hager-Zhang** (``"hager-zhang"``, shorthand ``"hz"``) satisfies the
+  *approximate Wolfe* conditions. Like Lewis-Overton it enforces curvature, and
+  it additionally stays sound in the floating-point roundoff regime near a flat
+  optimum. Smooth-only, and by far the most machinery.
+
+Lewis-Overton is the rung that tells the other two apart. Hager-Zhang differs
+from Armijo in two ways at once, curvature enforcement and roundoff tolerance;
+Lewis-Overton has only the first, so running all three on a problem says which
+of the two is doing the work. On an ill-conditioned quadratic, Armijo and
+Lewis-Overton stall at the same gradient floor while Hager-Zhang goes on, which
+is how we know that floor is the value-based gate and not missing curvature. It
+is also the simplest search with a curvature guarantee, about a third the size
+of Hager-Zhang and readable in one sitting, so when Hager-Zhang misbehaves it is
+the reference to compare against. The README's *Line search overview* says
+which one to reach for.
 
 Common interface
 ----------------
-All three are registered in ``LINE_SEARCHES`` and share one signature, so the
-driver can dispatch without branching::
+All three are registered in ``LINE_SEARCHES`` under their full names, with
+:func:`canonical_name` mapping the shorthands onto them, and share one
+signature, so the driver can dispatch without branching::
 
     ls(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask)
         -> (x_new, f_new_smooth, g_new_smooth, f_new_total, alpha, n_eval, ok)
@@ -112,7 +127,7 @@ def _line_search_armijo(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_ma
     keeps taking unproductive steps until ``max_iter``; the driver catches only
     the provable case, where ``x + α·d == x`` exactly. This is the roundoff wall
     the approximate-Wolfe condition exists to climb over, so switch to
-    ``line_search="hz"`` if the last few digits matter.
+    ``line_search="hager-zhang"`` if the last few digits matter.
     """
     lam = p.l1_lambda
     alpha = alpha0
@@ -147,13 +162,32 @@ def _line_search_lewis_overton(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p
         sufficient decrease:  φ(α) ≤ φ(0) + c₁·α·φ'(0)
         curvature (weak):     φ'(α) ≥ c₂·φ'(0)
 
-    with a textbook bracket-and-bisect. ``lo`` is the low side, where sufficient
-    decrease holds but the slope is still too negative, and ``hi`` is the high
-    side, where sufficient decrease failed. Because the curvature condition is
-    enforced, every L-BFGS secant pair has ``sᵀy > 0``, which backtracking Armijo
-    cannot promise. Unlike Hager-Zhang the sufficient-decrease gate is
-    value-based, so this search is *not* roundoff-tolerant: on flat directions
-    near the optimum prefer ``"hz"``.
+    with the textbook bracket-and-bisect of Lewis & Overton (2013). ``lo`` is the
+    low side, where sufficient decrease holds but the slope is still too
+    negative, and ``hi`` is the high side, where sufficient decrease failed. A
+    trial that undershoots is doubled until something overshoots, so a too-short
+    initial step is grown rather than taken as is; once both sides are set the
+    bracket is bisected. Each trial costs one ``(f, g)`` evaluation, the same as
+    an Armijo backtrack.
+
+    Why this search exists alongside the other two:
+
+    * It is the smallest step up from Armijo that guarantees the curvature
+      condition. Because curvature is enforced, the secant pairs it certifies
+      have ``sᵀy > 0``, which backtracking Armijo cannot promise and the
+      driver's ``curv_eps`` guard otherwise has to screen. The *weak* form is
+      deliberate: it accepts any step past the point where the slope has
+      flattened enough, which is all L-BFGS needs, and never rejects one for
+      overshooting the one-dimensional minimizer.
+    * It is the control for Hager-Zhang. The two share the curvature guarantee
+      and differ only in the sufficient-decrease gate, so wherever they diverge
+      the approximate-Wolfe condition is what made the difference, and wherever
+      Hager-Zhang misbehaves this is the simple reference to compare against.
+
+    Unlike Hager-Zhang the sufficient-decrease gate is value-based, so this
+    search is *not* roundoff-tolerant: once ``φ(α) - φ(0)`` shrinks into the
+    rounding error of ``φ(0)`` it can no longer verify a decrease and stops. On
+    flat directions near the optimum prefer ``"hager-zhang"``.
 
     Smooth objectives only. ``f0_total`` and ``l1_mask`` are unused (see the
     module docstring).
@@ -201,7 +235,8 @@ def _line_search_lewis_overton(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p
     # a step so small that x + t·d == x in float, and returning that as a success
     # would make the driver re-take an identical null step every iteration until
     # max_iter. In that case report failure instead, so the driver stops cleanly
-    # with precision_loss. This is exactly the roundoff regime where "hz" wins.
+    # with precision_loss. This is exactly the roundoff regime where
+    # "hager-zhang" wins.
     if best is not None:
         phi_t, t, x_t, g_t = best
         if np.linalg.norm(x_t - x) > _STEP_FLOOR * max(1.0, np.linalg.norm(x)):
@@ -209,7 +244,7 @@ def _line_search_lewis_overton(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p
     return x, phi0, g0, phi0, 0.0, n_eval, False
 
 
-def _line_search_hz(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
+def _line_search_hager_zhang(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     """
     Hager-Zhang line search satisfying the approximate Wolfe conditions.
 
@@ -368,14 +403,37 @@ def _line_search_hz(fun, x, d, f0_smooth, f0_total, g0, dg, alpha0, p, l1_mask):
     return x, phi0, g0, phi0, 0.0, n_eval[0], False
 
 
-# The dispatch table the driver indexes with `Params.line_search`.
+# The dispatch table the driver indexes with `Params.line_search`, keyed by the
+# full names. `canonical_name` maps the shorthands in `ALIASES` onto these keys.
 LINE_SEARCHES = {
     "armijo": _line_search_armijo,
-    "hz": _line_search_hz,
-    "lewis_overton": _line_search_lewis_overton,
+    "lewis-overton": _line_search_lewis_overton,
+    "hager-zhang": _line_search_hager_zhang,
+}
+
+# Two-letter shorthands, accepted wherever the full name is.
+ALIASES = {
+    "lo": "lewis-overton",
+    "hz": "hager-zhang",
 }
 
 # Searches that read the slope φ'(α) and therefore need a differentiable
 # objective. The driver rejects them when `l1_lambda > 0`, because the orthant
 # snapping puts a kink in φ wherever a coordinate crosses zero.
-SMOOTH_ONLY = frozenset({"hz", "lewis_overton"})
+SMOOTH_ONLY = frozenset({"lewis-overton", "hager-zhang"})
+
+
+def canonical_name(line_search):
+    """
+    Resolve a ``Params.line_search`` value to its key in ``LINE_SEARCHES``.
+
+    Accepts a full name or one of the ``ALIASES``. Anything else raises
+    ``ValueError`` listing both spellings, so the user sees every accepted form.
+    """
+    name = ALIASES.get(line_search, line_search)
+    if name not in LINE_SEARCHES:
+        raise ValueError(
+            f"unknown line_search {line_search!r}; expected one of {sorted(LINE_SEARCHES)} "
+            f"or a shorthand {sorted(ALIASES)}"
+        )
+    return name

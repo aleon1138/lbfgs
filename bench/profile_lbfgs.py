@@ -108,9 +108,9 @@ def warmup():
     """
     f, x0, p, _ = quadratic(6, seed=1)
     minimize(f, x0, p)
-    f, x0, p, _ = quadratic(6, line_search="hz", seed=1)
+    f, x0, p, _ = quadratic(6, line_search="hager-zhang", seed=1)
     minimize(f, x0, p)
-    f, x0, p, _ = quadratic(6, line_search="lewis_overton", seed=1)
+    f, x0, p, _ = quadratic(6, line_search="lewis-overton", seed=1)
     minimize(f, x0, p)
     f, x0, p, _ = lasso(40, 12, 3, seed=1)
     minimize(f, x0, p)
@@ -167,8 +167,8 @@ if __name__ == "__main__":
     problems = [
         quadratic(100),
         quadratic(500),
-        quadratic(500, line_search="hz"),
-        quadratic(500, line_search="lewis_overton"),
+        quadratic(500, line_search="hager-zhang"),
+        quadratic(500, line_search="lewis-overton"),
         lasso(5000, 500, 10),
         lasso(20000, 2000, 25),
         cheap_highdim(2000),

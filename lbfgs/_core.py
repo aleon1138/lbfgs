@@ -7,10 +7,11 @@ L-BFGS with two extensions the SciPy optimizers don't provide:
   penalty through a pseudo-gradient and an orthant projection, so that
   coefficients can be driven exactly to zero.
 * A choice of line search, implemented in :mod:`lbfgs._linesearch`: backtracking
-  **Armijo** (the default, and the only one valid under L1), **Hager-Zhang**
-  approximate-Wolfe (roundoff-tolerant on flat or ill-conditioned smooth
-  directions), and **Lewis-Overton** weak-Wolfe (a simpler search that still
-  guarantees the curvature condition, for smooth problems).
+  **Armijo** (the default, and the only one valid under L1), **Lewis-Overton**
+  weak-Wolfe (the simplest search that guarantees the curvature condition, for
+  smooth problems), and **Hager-Zhang** approximate-Wolfe (roundoff-tolerant on
+  flat or ill-conditioned smooth directions). ``Params.line_search`` names them
+  ``"armijo"``, ``"lewis-overton"`` (``"lo"``) and ``"hager-zhang"`` (``"hz"``).
 
 :func:`minimize` is the only public entry point; :class:`Params` and
 :class:`Result` are its configuration and return types. Everything else here is
@@ -33,9 +34,9 @@ from typing import ClassVar
 import numpy as np
 
 from ._kernels import _norm2, _pseudo_gradient, _total_objective
-from ._linesearch import _HZ_DELTA, LINE_SEARCHES, SMOOTH_ONLY
+from ._linesearch import _HZ_DELTA, LINE_SEARCHES, SMOOTH_ONLY, canonical_name
 
-Objective = Callable[[np.ndarray], tuple[float, np.ndarray]]
+Objective = Callable[..., tuple[float, np.ndarray]]  # fun(x, *args) -> (f, grad)
 
 
 @dataclass
@@ -48,8 +49,11 @@ class Params:
     The README's *Params* table and *Troubleshooting* section explain how to tune
     these.
 
-    Two details the one-line field comments leave out:
+    Three details the one-line field comments leave out:
 
+    * ``line_search`` takes a full name or its two-letter shorthand: ``"lo"``
+      for ``"lewis-overton"`` and ``"hz"`` for ``"hager-zhang"``. The README's
+      *Line search overview* says which one to pick.
     * ``ls_alpha0`` is the first trial step of each line search once the secant
       history is non-empty. The very first iteration, and the first after a
       history reset, uses ``1/‖pg‖`` instead, since there is no curvature
@@ -63,11 +67,11 @@ class Params:
     max_iter:        int   = 800       # iteration cap
     l1_lambda:       float = 0.0       # L1 penalty weight; > 0 switches on OWL-QN
     gtol:            float = 1e-6      # stop once the RMS pseudo-gradient falls below this
-    line_search:     str   = "armijo"  # "armijo" | "hz" (Hager-Zhang) | "lewis_overton"
+    line_search:     str   = "armijo"  # "armijo" | "lewis-overton" ("lo") | "hager-zhang" ("hz")
     ls_alpha0:       float = 1.0       # initial trial step (see the class docstring)
     ls_rho:          float = 0.5       # backtracking shrink factor (Armijo only)
-    ls_c1:           float = 1e-4      # sufficient-decrease constant c₁ (not used by hz)
-    ls_c2:           float = 0.9       # Wolfe curvature constant σ (hz and lewis_overton)
+    ls_c1:           float = 1e-4      # sufficient-decrease constant c₁ (Armijo, Lewis-Overton)
+    ls_c2:           float = 0.9       # Wolfe curvature constant σ (Lewis-Overton, Hager-Zhang)
     ls_max_iter:     int   = 40        # objective evaluations a single line search may spend
     ls_stall_factor: float = 10.0      # ls failure with rms_grad < factor·gtol is a benign stall
     curv_eps:        float = 1e-12     # keep a secant pair only if yᵀs > curv_eps·sᵀs
@@ -90,19 +94,16 @@ class Params:
         if not 0.0 < self.ls_rho < 1.0:
             raise ValueError(f"ls_rho must be in (0, 1); got {self.ls_rho}")
 
-        if self.line_search not in LINE_SEARCHES:
-            raise ValueError(
-                f"unknown line_search {self.line_search!r}; expected one of {sorted(LINE_SEARCHES)}"
-            )
-        if self.line_search in SMOOTH_ONLY and self.l1_lambda > 0.0:
+        name = canonical_name(self.line_search)  # raises ValueError on an unknown name
+        if name in SMOOTH_ONLY and self.l1_lambda > 0.0:
             # The Wolfe searches read the slope φ'(α), which the L1 orthant
             # snapping makes discontinuous, so they only work on smooth problems.
-            raise ValueError(f"{self.line_search!r} requires l1_lambda == 0 (use 'armijo' for L1)")
+            raise ValueError(f"{name!r} requires l1_lambda == 0 (use 'armijo' for L1)")
 
         # Each Wolfe search puts its own constraints on the constants.
-        if self.line_search == "hz" and not _HZ_DELTA < self.ls_c2 < 1.0:
+        if name == "hager-zhang" and not _HZ_DELTA < self.ls_c2 < 1.0:
             raise ValueError(f"Hager-Zhang needs {_HZ_DELTA} < ls_c2 < 1; got {self.ls_c2}")
-        if self.line_search == "lewis_overton" and not 0.0 < self.ls_c1 < self.ls_c2 < 1.0:
+        if name == "lewis-overton" and not 0.0 < self.ls_c1 < self.ls_c2 < 1.0:
             raise ValueError(
                 "Lewis-Overton needs 0 < ls_c1 < ls_c2 < 1; "
                 f"got ls_c1={self.ls_c1}, ls_c2={self.ls_c2}"
@@ -136,8 +137,8 @@ class Result:
             The line search could not find a sufficient-decrease step, but the
             gradient was already within ``ls_stall_factor`` of ``gtol``. The
             objective is flat to within roundoff, so this is a benign stall at
-            the optimum and counts as converged. ``line_search="hz"`` can usually
-            squeeze out a few more digits.
+            the optimum and counts as converged. ``line_search="hager-zhang"``
+            can usually squeeze out a few more digits.
         ``"ls_failed"``
             The line search could not find a sufficient-decrease step while the
             gradient was still large. This is a genuine failure: a bad direction,
@@ -180,17 +181,22 @@ class Result:
 
 
 class _Counted:
-    """Wraps the user's objective to count evaluations for ``Result.nfev``."""
+    """
+    Wraps the user's objective to count evaluations for ``Result.nfev`` and to
+    bind the extra ``args``, so the driver and the line searches see a plain
+    ``fun(x)``.
+    """
 
-    __slots__ = ("fun", "n")
+    __slots__ = ("fun", "args", "n")
 
-    def __init__(self, fun: Objective):
+    def __init__(self, fun: Objective, args: tuple = ()):
         self.fun = fun
+        self.args = args
         self.n = 0
 
     def __call__(self, x: np.ndarray) -> tuple[float, np.ndarray]:
         self.n += 1
-        return self.fun(x)
+        return self.fun(x, *self.args)
 
 
 def _two_loop_recursion(pg: np.ndarray, secant_history: deque) -> np.ndarray:
@@ -228,7 +234,9 @@ def _two_loop_recursion(pg: np.ndarray, secant_history: deque) -> np.ndarray:
     return -r
 
 
-def minimize(fun: Objective, x0: np.ndarray, params: Params | None = None) -> Result:
+def minimize(
+    fun: Objective, x0: np.ndarray, params: Params | None = None, args: tuple = ()
+) -> Result:
     """
     Minimize ``f(x) + l1_lambda·‖x‖₁`` with L-BFGS, or OWL-QN when ``l1_lambda > 0``.
 
@@ -239,12 +247,16 @@ def minimize(fun: Objective, x0: np.ndarray, params: Params | None = None) -> Re
     Parameters
     ----------
     fun : callable
-        ``fun(x) -> (f, grad)``, the value and gradient of the **smooth** part of
-        the objective.
+        ``fun(x, *args) -> (f, grad)``, the value and gradient of the **smooth**
+        part of the objective.
     x0 : ndarray
         Starting point. A non-empty 1-D array; it is copied and cast to float64.
     params : Params, optional
         Algorithm settings. Defaults are used when ``None``.
+    args : tuple, optional
+        Extra arguments passed to ``fun``, as in :func:`scipy.optimize.minimize`:
+        ``fun(x, *args)`` is called at every evaluation. A single non-tuple value
+        is wrapped in a 1-tuple, so ``args=A`` means ``fun(x, A)``.
 
     Returns
     -------
@@ -259,11 +271,14 @@ def minimize(fun: Objective, x0: np.ndarray, params: Params | None = None) -> Re
       means the same per-component accuracy at any parameter count. If ``fun``
       sums over ``n`` samples in float64, scale ``gtol`` by ``sqrt(n)`` to clear
       the accumulation noise floor, or better, normalize the objective by ``n``.
-    * The Wolfe searches (``"hz"`` and ``"lewis_overton"``) are smooth-only and
-      raise ``ValueError`` when ``l1_lambda > 0``. Use ``"armijo"`` for L1.
+    * The Wolfe searches (``"lewis-overton"`` and ``"hager-zhang"``) are
+      smooth-only and raise ``ValueError`` when ``l1_lambda > 0``. Use
+      ``"armijo"`` for L1.
     """
     p = Params() if params is None else params
     p._validate()  # again, in case a field was reassigned after construction
+    if not isinstance(args, tuple):
+        args = (args,)  # SciPy's convenience: a lone extra argument need not be a 1-tuple
 
     x = np.array(x0, dtype=np.float64)
     if x.ndim != 1 or x.size == 0:
@@ -276,10 +291,10 @@ def minimize(fun: Objective, x0: np.ndarray, params: Params | None = None) -> Re
         l1_mask[p.l1_mask] = False
 
     lam = p.l1_lambda
-    line_search = LINE_SEARCHES[p.line_search]
+    line_search = LINE_SEARCHES[canonical_name(p.line_search)]
     secant_history: deque = deque(maxlen=p.m)  # (s, y, 1/sᵀy) triples, oldest first
     history: list[tuple] = []
-    obj = _Counted(fun)
+    obj = _Counted(fun, args)
     sqrt_dim = np.sqrt(x.size)
 
     f_smooth, g_smooth = obj(x)
