@@ -1,12 +1,12 @@
 """
 Numba kernels for the ``lbfgs`` package.
 
-The element-wise and reduction inner loops, kept in their own module so both
-:mod:`lbfgs._core` and :mod:`lbfgs._linesearch` can use them without a circular
-import.
+These are the element-wise and reduction inner loops. They live in their own
+module so that both :mod:`lbfgs._core` and :mod:`lbfgs._linesearch` can import
+them without a circular dependency.
 
 Every L1 kernel takes a boolean ``mask`` marking the coordinates the penalty
-applies to. Note this is the *complement* of :attr:`lbfgs.Params.l1_mask`, which
+applies to. That is the *complement* of :attr:`lbfgs.Params.l1_mask`, which
 lists the coordinates to exempt.
 """
 
@@ -17,16 +17,16 @@ import numpy as np
 @numba.njit(fastmath=True)
 def _norm2(x: np.ndarray) -> float:
     """
-    Euclidean norm ``||x||₂``.
+    Euclidean norm ``‖x‖₂``.
 
-    ``fastmath`` is what makes a hand-rolled loop worth having: without it numba
-    may not reassociate the accumulator, so the loop stays scalar and loses to
+    ``fastmath`` is what makes a hand-rolled loop worth having. Without it numba
+    will not reassociate the accumulator, so the loop stays scalar and loses to
     BLAS past a few thousand elements. Reassociation is safe here because every
-    term is non-negative — there is nothing to cancel catastrophically — and over
+    term is non-negative, so there is nothing to cancel catastrophically; over
     2000 random vectors the result matched an extended-precision reference to
     3.4e-15 relative, the same as the strict-order loop.
 
-    Measured µs/call against the alternatives (n = vector length):
+    Measured µs per call against the alternatives, for vectors of length ``n``:
 
     ==========  ======  ================  ===================
     n           this    ``np.linalg``     ``np.sqrt(x.dot(x))``
@@ -37,9 +37,9 @@ def _norm2(x: np.ndarray) -> float:
     100_000      10.7               9.45                  8.54
     ==========  ======  ================  ===================
 
-    A clear win below ~10k, where numpy's dispatch overhead dominates the actual
-    arithmetic, and a wash above it — which is the range the optimizer's own
-    per-iteration overhead is measured in.
+    A clear win below roughly 10k elements, where numpy's dispatch overhead
+    dominates the arithmetic, and a wash above that. The low end is the range the
+    optimizer's own per-iteration overhead is measured in.
     """
     z = 0.0
     for i in range(len(x)):
@@ -50,16 +50,17 @@ def _norm2(x: np.ndarray) -> float:
 @numba.njit
 def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarray:
     """
-    Pseudo-gradient of ``f(x) + lam·||x||₁`` — Andrew & Gao's ⋄ operator.
+    Pseudo-gradient of ``f(x) + lam·‖x‖₁``, Andrew & Gao's ⋄ operator.
 
-    At ``x_i != 0`` the objective is differentiable, so this is the ordinary
-    gradient of the L1 term, ``lam·sign(x_i)``. At ``x_i == 0`` the subdifferential
-    is the interval ``[g_i - lam, g_i + lam]``; take its element of steepest
-    descent, or exactly zero when the interval straddles zero (in which case the
-    coordinate is already optimal and stays pinned at zero).
+    Where ``x_i != 0`` the objective is differentiable, so the entry is the
+    ordinary gradient ``g_i + lam·sign(x_i)``. Where ``x_i == 0`` the
+    subdifferential is the interval ``[g_i - lam, g_i + lam]``, and the entry is
+    its element of smallest magnitude, which is the soft-threshold of ``g_i``.
+    That is exactly zero when the interval straddles zero, meaning the
+    coordinate is already optimal and stays pinned there.
 
-    Vectorized numpy needs ~9.5x longer than this loop, because the two branches
-    force it to compute both arms and select.
+    Vectorized numpy takes about 9.5x longer than this loop, because the two
+    branches force it to compute both arms and then select.
     """
     if lam == 0.0:
         return g.copy()
@@ -78,7 +79,7 @@ def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarr
 
 @numba.njit
 def _total_objective(f_smooth: float, x: np.ndarray, lam: float, mask) -> float:
-    """The regularized objective ``f(x) + lam·||x||₁``, summed over ``mask`` only."""
+    """The regularized objective ``f(x) + lam·‖x‖₁``, with the norm over ``mask`` only."""
     if lam == 0.0:
         return f_smooth
     norm_1 = 0.0

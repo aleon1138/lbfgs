@@ -128,18 +128,19 @@ pip install -e .
 | `l1_lambda`   | `0.0`      | L1 weight; `> 0` enables OWL-QN |
 | `gtol`        | `1e-6`     | RMS pseudo-gradient tolerance (see *Convergence*) |
 | `line_search` | `"armijo"` | `"armijo"` (backtracking), `"hz"` (Hager-Zhang), or `"lewis_overton"` (weak Wolfe) |
-| `ls_alpha0`   | `1.0`      | initial step size |
+| `ls_alpha0`   | `1.0`      | initial trial step; the first iteration (and the first after a history reset) uses $1/\lVert \mathrm{pg} \rVert$ instead |
 | `ls_rho`      | `0.5`      | Armijo backtracking shrink factor |
-| `ls_c1`       | `1e-4`     | Armijo sufficient-decrease constant |
+| `ls_c1`       | `1e-4`     | sufficient-decrease constant $c_1$ (Armijo and Lewis-Overton; Hager-Zhang fixes its own at $\delta = 0.1$) |
 | `ls_c2`       | `0.9`      | Wolfe curvature constant $\sigma$ (Hager-Zhang and Lewis-Overton) |
-| `ls_max_iter` | `40`       | max line-search iterations |
+| `ls_max_iter` | `40`       | objective evaluations a single line search may spend |
 | `ls_stall_factor` | `10.0` | a line-search failure with `rms_grad` $<$ `factor`$\cdot$`gtol` is a benign stall, not an error |
 | `curv_eps`    | `1e-12`    | minimum $y^\top s$ to accept a secant pair |
 | `l1_mask`     | `None`     | coordinate indices (or a boolean mask) exempt from the L1 penalty |
 
 `Params` validates itself on construction, so an impossible combination — an
-unknown `line_search`, a Wolfe search with `l1_lambda > 0`, `ls_c1 >= ls_c2` —
-raises `ValueError` where you set it rather than deep inside a line search.
+unknown `line_search`, a Wolfe search with `l1_lambda > 0`, `ls_c1 >= ls_c2`
+under `"lewis_overton"` — raises `ValueError` where you set it rather than deep
+inside a line search.
 
 ### `Result`
 
@@ -251,7 +252,7 @@ comfortably positive.
   something structural is off (collinearity, scaling).
 * Watch `Result.history.ls_iter`: consistently hitting 20+ backtracks means the
   Hessian approximation is producing poor directions — reduce `m`, tighten
-  `curv_eps`, or loosen `ls_c1` / `ls_c2` (Wolfe-only).
+  `curv_eps`, or loosen `ls_c1` (or `ls_c2`, for the Wolfe searches).
 
 ## Performance & profiling
 
