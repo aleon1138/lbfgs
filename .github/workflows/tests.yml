@@ -15,8 +15,8 @@ jobs:
         os: [ubuntu-latest, macos-latest] # OpenBLAS vs Accelerate numpy builds
         python: ["3.10", "3.14"] # oldest supported and newest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
       - run: uv run --extra test pytest -v
@@ -26,8 +26,8 @@ jobs:
     name: oldest deps (numpy 1.24, numba 0.60)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.10"
       # --no-project skips installing lbfgs and its latest-version deps; the
@@ -40,7 +40,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
       - run: uvx ruff check .
       - run: uvx ruff format --check .
