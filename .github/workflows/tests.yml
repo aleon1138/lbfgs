@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # one red cell shouldn't cancel the others
+      matrix:
+        os: [ubuntu-latest, macos-latest] # OpenBLAS vs Accelerate numpy builds
+        python: ["3.10", "3.14"] # oldest supported and newest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv run --extra test pytest -v
+
+  # The oldest numpy/numba that pyproject.toml claims to support.
+  oldest-deps:
+    name: oldest deps (numpy 1.24, numba 0.60)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.10"
+      # --no-project skips installing lbfgs and its latest-version deps; the
+      # pytest `pythonpath = ["."]` setting imports it from the checkout instead.
+      - run: >-
+          uv run --isolated --no-project
+          --with "numpy==1.24.*" --with "numba==0.60.*" --with pytest
+          pytest -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx ruff check .
+      - run: uvx ruff format --check .
