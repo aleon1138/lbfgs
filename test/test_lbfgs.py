@@ -1,11 +1,15 @@
 """
 Unit tests for the ``lbfgs`` package.
 
-Organized roughly outside-in: end-to-end solves through :func:`lbfgs.minimize`
-first, then the Wolfe line searches and their failure modes, then the argument
-validation and reporting surface, and finally the numerical kernels checked
-against independent references. The test problems and the line-search harness
-are module-level helpers, defined just below the imports.
+The order is approximately from the outside in:
+
+1. end-to-end solves through :func:`lbfgs.minimize`;
+2. the Wolfe line searches and their failure modes;
+3. argument validation and the reported results;
+4. the numerical kernels, compared with independent references.
+
+The test problems and the line-search harness are module-level helpers,
+immediately after the imports.
 """
 
 from collections import deque
@@ -17,21 +21,21 @@ from lbfgs import Params, Result, minimize
 from lbfgs import _core, _kernels, _linesearch
 
 ALL_SEARCHES = sorted(_linesearch.LINE_SEARCHES)
-WOLFE_SEARCHES = sorted(_linesearch.SMOOTH_ONLY)  # the two that enforce curvature
+WOLFE_SEARCHES = sorted(_linesearch.SMOOTH_ONLY)  # the two searches that enforce curvature
 
 
 # --------------------------------------------------------------------------- #
-# Shared test problems. Every objective is fn(x) -> (f, grad) of the smooth part;
-# the L1 term, where there is one, is left to the optimizer.
+# Shared test problems. Each objective is fn(x) -> (f, grad) of the smooth part.
+# The optimiser adds the L1 term, if there is one.
 # --------------------------------------------------------------------------- #
 def _bowl(x):
-    """The bowl 0.5·‖x‖², minimized at the origin. Works in any dimension."""
+    """The bowl 0.5·‖x‖², with its minimum at the origin. Works in all dimensions."""
     return 0.5 * float(x.dot(x)), x.copy()
 
 
 def _bowl_line():
-    """The bowl restricted to a line, as (fn, x0, d): from x0 = -10 along d = +1
-    the minimizer sits at t = 10, so a unit step is Newton-quality."""
+    """The bowl on a line, as (fn, x0, d). From x0 = -10 along d = +1, the
+    minimiser is at t = 10. Thus a unit step has Newton quality."""
     return _bowl, np.array([-10.0]), np.array([1.0])
 
 
@@ -51,23 +55,23 @@ def _well_conditioned_quad(n=20, seed=7):
 def _ill_conditioned_quad(n=30, seed=3, log10_kappa=4):
     """A quadratic with a controlled condition number, as (fn, x_star).
 
-    At the default kappa ~ 1e4 the value-based searches (Armijo, Lewis-Overton)
-    stall at an rms_grad floor near 1e-6. Exactly where depends on last-bit
-    rounding in ``A @ x``, and so on the BLAS numpy is linked against; across
-    seeds it ranges over roughly 7e-7 to 1e-5. Tests that need a clean "gtol"
-    stay at 1e-5 or above; tests that need a stall stay below 1e-7,
-    ``ls_stall_factor`` included.
+    At the default kappa ~ 1e4, the value-based searches (Armijo, Lewis-Overton)
+    stall at an rms_grad floor near 1e-6. The exact value depends on last-bit
+    rounding in ``A @ x``, and thus on the BLAS that numpy uses. Across seeds,
+    it is approximately in the range 7e-7 to 1e-5. Tests that need a clean
+    "gtol" use 1e-5 or more. Tests that need a stall use less than 1e-7,
+    including ``ls_stall_factor``.
 
-    The same rule applies to every test below that asserts ``reason == "gtol"``:
-    keep gtol well above the *worst-case* stall floor, measured by re-running
-    the problem under many column permutations, or a BLAS change can flip the
-    outcome. One machine's floor is a single sample and can be off by orders of
-    magnitude."""
+    The same rule applies to all tests below that assert ``reason == "gtol"``.
+    Keep gtol much above the *worst-case* stall floor. To find this floor, run
+    the problem again with many column permutations. If you do not, a BLAS
+    change can change the result. The floor on one machine is only one sample,
+    and it can be wrong by orders of magnitude."""
     rng = np.random.default_rng(seed)
     eig = np.logspace(0, log10_kappa, n)
     Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
     A = (Q * eig) @ Q.T
-    A = 0.5 * (A + A.T)  # symmetrize away the QR's rounding asymmetry
+    A = 0.5 * (A + A.T)  # symmetrise to remove the rounding asymmetry from QR
     b = rng.standard_normal(n)
 
     def fn(x):
@@ -76,18 +80,18 @@ def _ill_conditioned_quad(n=30, seed=3, log10_kappa=4):
     return fn, np.linalg.solve(A, b)
 
 
-# The gtol for the OWL-QN tests on _lasso_problem. Near the optimum Armijo stops
-# at the first step whose objective rounds up by an ULP, so where OWL-QN stalls
-# is close to random: merely permuting the columns of X (which is all a different
-# BLAS does) spreads the stall point over roughly 1e-13 to 7e-8. 1e-6 clears the
-# worst of that by 14x; the optimality checks, not gtol, are what make these
-# tests strict.
+# The gtol for the OWL-QN tests on _lasso_problem. Near the optimum, Armijo stops
+# at the first step where the objective rounds up by one ULP. Thus the point
+# where OWL-QN stalls is almost random. A permutation of the columns of X (this
+# is all that a different BLAS does) moves the stall point across approximately
+# 1e-13 to 7e-8. The value 1e-6 is 14x above the worst case. The optimality
+# checks, not gtol, make these tests strict.
 _OWLQN_GTOL = 1e-6
 
 
 def _lasso_problem(rng, n=120, p_dim=25, nnz=5):
-    """Sparse linear regression, as (fn, X, y). ``fn`` is the half sum of squared
-    residuals, the smooth part of a LASSO objective."""
+    """Sparse linear regression, as (fn, X, y). ``fn`` is half the sum of
+    squared residuals. This is the smooth part of a LASSO objective."""
     X = rng.standard_normal((n, p_dim))
     w = np.zeros(p_dim)
     w[rng.choice(p_dim, nnz, replace=False)] = rng.standard_normal(nnz) * 2
@@ -102,8 +106,8 @@ def _lasso_problem(rng, n=120, p_dim=25, nnz=5):
 
 def _logistic_problem(seed=123, n=300, p_dim=40, nnz=None):
     """Logistic regression, as (fn, X, y). ``fn`` is the mean negative
-    log-likelihood. The true weights are dense unless ``nnz`` asks for a sparse
-    vector with that many non-zeros."""
+    log-likelihood. The true weights are dense, unless ``nnz`` is set. In that
+    case, they are a sparse vector with ``nnz`` non-zero values."""
     rng = np.random.default_rng(seed)
     if nnz is None:
         w_true = rng.standard_normal(p_dim)
@@ -128,10 +132,10 @@ def _logistic_problem(seed=123, n=300, p_dim=40, nnz=None):
 # --------------------------------------------------------------------------- #
 def _run_line_search(name, fun, x, d, alpha0, p):
     """
-    Invoke the named line search through the shared interface on a smooth
-    problem (``l1_lambda == 0``), flattened to (x_new, f_new, g_new, alpha,
-    n_eval, ok). Without an L1 term the f_total slot must duplicate f_smooth, so
-    it is checked and dropped.
+    Call the named line search through the shared interface on a smooth problem
+    (``l1_lambda == 0``). Return (x_new, f_new, g_new, alpha, n_eval, ok).
+    Without an L1 term, the f_total value must be equal to f_smooth. The
+    function checks this value and then removes it.
     """
     ls = _linesearch.LINE_SEARCHES[name]
     f0, g0 = fun(x)
@@ -143,7 +147,7 @@ def _run_line_search(name, fun, x, d, alpha0, p):
 
 
 def _approx_wolfe_holds(loss_fn, x, d, alpha, p):
-    """True if `alpha` satisfies Hager-Zhang's ordinary OR approximate Wolfe conditions."""
+    """True if `alpha` satisfies the ordinary OR approximate Wolfe conditions of Hager-Zhang."""
     delta, sigma = _linesearch._HZ_DELTA, p.ls_c2
     phi0, g0 = loss_fn(x)
     dphi0 = float(g0.dot(d))
@@ -156,7 +160,7 @@ def _approx_wolfe_holds(loss_fn, x, d, alpha, p):
 
 
 def _weak_wolfe_holds(loss_fn, x, d, alpha, p):
-    """True if `alpha` satisfies the weak Wolfe conditions with `p`'s c1 and c2."""
+    """True if `alpha` satisfies the weak Wolfe conditions with c1 and c2 from `p`."""
     phi0, g0 = loss_fn(x)
     dphi0 = float(g0.dot(d))
     phia, ga = loss_fn(x + alpha * d)
@@ -164,7 +168,7 @@ def _weak_wolfe_holds(loss_fn, x, d, alpha, p):
     return phia <= phi0 + p.ls_c1 * alpha * dphi0 and dphia >= p.ls_c2 * dphi0
 
 
-# The conditions each Wolfe search promises to satisfy.
+# The conditions that each Wolfe search must satisfy.
 _WOLFE_HOLDS = {
     "lewis-overton": _weak_wolfe_holds,
     "hager-zhang": _approx_wolfe_holds,
@@ -179,8 +183,8 @@ class TestMinimize:
     @pytest.mark.parametrize("ls", ALL_SEARCHES)
     def test_quadratic_under_every_line_search(self, ls):
         """Each line search solves a well-conditioned quadratic to the true
-        optimum, accepting the Newton-quality unit step on the first trial most
-        iterations."""
+        optimum. On most iterations, it accepts the Newton-quality unit step on
+        the first trial."""
         fn, x_star = _well_conditioned_quad()
         r = minimize(fn, np.zeros(20), Params(line_search=ls, max_iter=200, gtol=1e-6))
         assert r.reason == "gtol"
@@ -189,9 +193,9 @@ class TestMinimize:
         assert np.mean(r.history.ls_iter) <= 3.0
 
     def test_l1_only(self):
-        """Pure L1: minimize lambda * ||x||_1 with f = 0. The solution is x = 0,
-        and since every non-zero coordinate has |pg_i| = lambda, reaching gtol
-        means every coordinate was snapped to exactly zero."""
+        """Pure L1: minimise lambda * ||x||_1 with f = 0. The solution is x = 0.
+        Each non-zero coordinate has |pg_i| = lambda. Thus, if the solver
+        reaches gtol, it set each coordinate to exactly zero."""
         x0 = np.random.default_rng(99).standard_normal(10) * 5.0
         r = minimize(
             lambda x: (0.0, np.zeros_like(x)), x0, Params(l1_lambda=1.0, max_iter=100, gtol=1e-12)
@@ -200,7 +204,7 @@ class TestMinimize:
         np.testing.assert_array_equal(r.theta, 0.0)
 
     def test_l1_logistic(self):
-        """Sparse L1-regularized logistic regression fits the training data."""
+        """Sparse logistic regression with L1 regularisation fits the training data."""
         fn, X, y = _logistic_problem(nnz=5)
         r = minimize(fn, np.zeros(X.shape[1]), Params(l1_lambda=0.01, max_iter=500, gtol=1e-8))
         assert r.reason == "gtol"
@@ -208,7 +212,7 @@ class TestMinimize:
 
 
 # --------------------------------------------------------------------------- #
-# Extra arguments to the objective.
+# Extra arguments for the objective.
 # --------------------------------------------------------------------------- #
 def _quad(x, A, b):
     return 0.5 * x.dot(A @ x) - b.dot(x), A @ x - b
@@ -222,8 +226,9 @@ def _quad_data(n=6, seed=7):
 
 class TestArgs:
     def test_args_take_the_same_path_as_a_closure(self):
-        """Passing data through ``args`` is exactly equivalent to binding it in a
-        closure: same optimum, same iterates, same evaluation count."""
+        """Data in ``args`` gives exactly the same result as data bound in a
+        closure: the same optimum, the same iterates and the same evaluation
+        count."""
         A, b = _quad_data()
         r = minimize(_quad, np.zeros(6), args=(A, b))
         closed = minimize(lambda x: _quad(x, A, b), np.zeros(6))
@@ -234,7 +239,7 @@ class TestArgs:
 
     @pytest.mark.parametrize("ls", ALL_SEARCHES)
     def test_args_reach_every_evaluation(self, ls):
-        """Every call to ``fun``, line-search trials included, gets the extras."""
+        """Each call to ``fun``, including line-search trials, gets the extra arguments."""
         A, b = _quad_data()
         seen = []
 
@@ -247,7 +252,8 @@ class TestArgs:
         assert seen == ["t"] * r.nfev
 
     def test_lone_arg_need_not_be_a_tuple(self):
-        """SciPy wraps a single non-tuple ``args`` value; so do we."""
+        """SciPy puts a single non-tuple ``args`` value into a tuple. This package
+        does the same."""
 
         def scaled_bowl(x, scale):
             return scale * 0.5 * float(x.dot(x)), scale * x
@@ -258,17 +264,18 @@ class TestArgs:
 
 
 # --------------------------------------------------------------------------- #
-# The two smooth-only searches, Lewis-Overton and Hager-Zhang: what they share,
-# and the roundoff tolerance that separates them.
+# The two smooth-only searches, Lewis-Overton and Hager-Zhang: the properties
+# that they share, and the roundoff tolerance that makes them different.
 # --------------------------------------------------------------------------- #
 class TestWolfeLineSearches:
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_expands_a_short_step(self, ls):
-        """When the initial step is too short for the curvature condition, the
-        bracketing phase expands past alpha0 and still returns a Wolfe point."""
+        """If the initial step is too short for the curvature condition, the
+        bracket phase increases the step past alpha0. It still returns a Wolfe
+        point."""
         fn, x0, d = _bowl_line()
         p = Params(line_search=ls)
-        # At alpha0 = 0.5 the slope is -9.5 < 0.9 * (-10), so curvature fails there.
+        # At alpha0 = 0.5, the slope is -9.5 < 0.9 * (-10), so curvature fails.
         _, _, _, alpha, _, ok = _run_line_search(ls, fn, x0, d, 0.5, p)
         assert ok
         assert alpha > 0.5
@@ -276,7 +283,7 @@ class TestWolfeLineSearches:
 
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_brackets_an_overshoot(self, ls):
-        """A wildly large initial step is bracketed back down to a Wolfe point."""
+        """The search brackets a very large initial step back down to a Wolfe point."""
         fn, x0, d = _bowl_line()
         p = Params(line_search=ls)
         _, _, _, alpha, _, ok = _run_line_search(ls, fn, x0, d, 1000.0, p)
@@ -286,27 +293,30 @@ class TestWolfeLineSearches:
 
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_every_secant_pair_has_curvature(self, ls):
-        """Both searches enforce the curvature condition, so on a moderately
-        ill-conditioned quadratic (kappa ~ 1e4) every secant pair has sᵀy > 0
-        and is kept — the property Armijo cannot guarantee. gtol stays well
-        above the value-based floor so Lewis-Overton reaches it cleanly."""
+        """The two searches enforce the curvature condition. Thus, on a
+        moderately ill-conditioned quadratic (kappa ~ 1e4), each secant pair has
+        sᵀy > 0, and the solver keeps it. Armijo cannot guarantee this property.
+        gtol stays much above the value-based floor, so Lewis-Overton reaches it
+        cleanly."""
         fn, _ = _ill_conditioned_quad()
         r = minimize(fn, np.zeros(30), Params(line_search=ls, max_iter=3000, gtol=1e-5))
         assert r.reason == "gtol"
-        assert r.nit > 100  # a long enough run for the property to mean something
+        assert r.nit > 100  # the run must be long for the property to be significant
         assert np.all(r.history.s_dot_y > 0.0)
         assert np.all(r.history.curv_ok)
 
     def test_value_based_searches_stall_at_a_floor_hz_does_not(self):
-        """The headline difference between the line searches.
+        """The main difference between the line searches.
 
-        Armijo's and Lewis-Overton's sufficient-decrease gates test the function
-        value, so once phi(alpha) - phi(0) shrinks into the rounding error they
-        can no longer verify a decrease and stop, near rms_grad ~ 1e-6 on this
-        problem. Hager-Zhang's approximate-Wolfe condition is slope-based and
-        keeps going. Both tolerances (and the 10x stall band above them) sit
-        well below the floor, and tightening gtol does not move the value-based
-        searches at all: they are at their floor, not merely short of the target.
+        The sufficient-decrease tests of Armijo and Lewis-Overton use the
+        function value. When phi(alpha) - phi(0) becomes smaller than the
+        rounding error, they cannot verify a decrease, and they stop. On this
+        problem, this occurs near rms_grad ~ 1e-6. The approximate-Wolfe
+        condition of Hager-Zhang uses the slope, and it continues.
+
+        The two tolerances (and the 10x stall band above them) are much below
+        the floor. A smaller gtol does not change the result of the value-based
+        searches. They are at their floor, not only short of the target.
         """
         fn, _ = _ill_conditioned_quad()
 
@@ -318,8 +328,9 @@ class TestWolfeLineSearches:
             for r in (loose, tight):
                 assert not r.converged, f"{ls} stopped with {r.reason}"
                 assert r.rms_grad > 1e-7
-            # Same stopping point whatever the tolerance: gtol is only read at
-            # termination, and termination here is the line search giving up.
+            # The stop point is the same for each tolerance. The solver reads gtol
+            # only at the stop, and here the stop occurs because the line search
+            # fails.
             assert loose.rms_grad == tight.rms_grad
             np.testing.assert_array_equal(loose.theta, tight.theta)
 
@@ -329,8 +340,8 @@ class TestWolfeLineSearches:
 
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_matches_armijo_on_a_logistic_loss(self, ls):
-        """On a smooth logistic loss, each Wolfe search reaches the same minimum
-        as backtracking Armijo."""
+        """On a smooth logistic loss, each Wolfe search gets the same minimum as
+        backtracking Armijo."""
         fn, X, _ = _logistic_problem()
         x0 = np.zeros(X.shape[1])
         ref = minimize(fn, x0, Params(line_search="armijo", gtol=1e-8))
@@ -341,13 +352,15 @@ class TestWolfeLineSearches:
 
 
 # --------------------------------------------------------------------------- #
-# A line search that runs out of evaluations must report failure, not raise.
+# A line search that uses all of its evaluations must report failure. It must
+# not raise an exception.
 # --------------------------------------------------------------------------- #
 class TestExhaustedBudget:
     @pytest.mark.parametrize("ls", ALL_SEARCHES)
     def test_zero_budget_reports_failure(self, ls):
-        """`Params` rejects ls_max_iter < 1, so reach the state by assigning past
-        the constructor: the internal invariant should hold regardless."""
+        """`Params` rejects ls_max_iter < 1. Thus, to get this state, set the
+        value after construction. The internal invariant must hold in all
+        cases."""
         fn, x, d = _bowl_line()
         p = Params(line_search=ls)
         p.ls_max_iter = 0
@@ -360,10 +373,10 @@ class TestExhaustedBudget:
     @pytest.mark.parametrize("budget", [1, 2, 3])
     @pytest.mark.parametrize("ls", ALL_SEARCHES)
     def test_tightest_real_budget_honours_the_contract(self, ls, budget):
-        """With one, two or three evaluations a search may or may not find a
-        step, but what it hands back must be consistent either way: on success
-        x_new is x + alpha*d with alpha > 0, on failure alpha is 0 and x comes
-        back unchanged. The budget is never overspent."""
+        """With one, two or three evaluations, a search can find a step or not.
+        But the values that it returns must be consistent in the two cases. On
+        success, x_new is x + alpha*d with alpha > 0. On failure, alpha is 0, and
+        x does not change. The search never uses more than the budget."""
         fn, x, d = _bowl_line()
         p = Params(line_search=ls, ls_max_iter=budget)
         x_new, _, _, alpha, n_eval, ok = _run_line_search(ls, fn, x, d, 1.0, p)
@@ -377,22 +390,25 @@ class TestExhaustedBudget:
 
 
 # --------------------------------------------------------------------------- #
-# A trial step far enough out can overflow the objective, so `fun` returns a
-# non-finite value or gradient. The slope g·d is then NaN, which compares False
-# against every test, so an unguarded search reads such a point as neither
-# sufficient decrease nor overshoot: it marches further out and hands the driver
-# an infinite gradient. The searches must instead read it as "step too long" and
-# pull back into the finite region, without ever forming the NaN (hence the
-# "invalid value" warning promoted to an error).
+# A trial step that is sufficiently far out can cause an overflow in the
+# objective. `fun` then returns a value or a gradient that is not finite. The
+# slope g·d is then NaN, which compares False in all tests. Thus a search with
+# no guard sees such a point as neither sufficient decrease nor overshoot. It
+# moves farther out and gives the driver an infinite gradient.
+#
+# The searches must instead see such a point as "step too long" and move back
+# into the finite region. They must also never make the NaN. Thus these tests
+# change the "invalid value" warning into an error.
 # --------------------------------------------------------------------------- #
 _OVERFLOW_AT = 700.0
 
 
 def _overflowing_ray():
-    """φ(a) = -a along d = (1, 1), so the slope stays -1 and never satisfies
-    curvature: the bracket keeps expanding until it walks into the overflow
-    region. The value stays finite there and only the gradient blows up, so a
-    value-based gate cannot catch it either. Returns (f, eval_counter)."""
+    """φ(a) = -a along d = (1, 1). The slope stays -1 and never satisfies
+    curvature. Thus the bracket continues to expand until it goes into the
+    overflow region. There, the value stays finite, and only the gradient
+    overflows. Thus a value-based test also cannot catch it. Returns
+    (f, eval_counter)."""
     n_eval = [0]
 
     def f(z):
@@ -408,29 +424,29 @@ class TestOverflowingObjective:
     @pytest.mark.filterwarnings("error:invalid value encountered")
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_overflowed_trial_pulls_back(self, ls):
-        """Hager-Zhang must bracket an overflowed trial instead of expanding past
-        it, and Lewis-Overton must not certify one as a Wolfe step."""
+        """Hager-Zhang must bracket an overflowed trial, and must not expand past
+        it. Lewis-Overton must not accept one as a Wolfe step."""
         f, n_eval = _overflowing_ray()
         x0, d = np.zeros(2), np.ones(2)
         p = Params(line_search=ls)
         x_new, _, g_new, alpha, _, ok = _run_line_search(ls, f, x0, d, 1.0, p)
-        spent = n_eval[0] - 1  # the harness's own f(x0) call is not line-search budget
+        spent = n_eval[0] - 1  # the f(x0) call of the harness is not line-search budget
 
-        # The search can never satisfy curvature here, but it does find
-        # sufficient decrease, so it salvages the best finite step.
+        # Here, the search cannot satisfy curvature. But it finds sufficient
+        # decrease, so it uses the best finite step.
         assert ok
         assert 0.0 < alpha <= _OVERFLOW_AT
         assert spent <= p.ls_max_iter
-        # An infinite gradient would poison the driver's secant history.
+        # An infinite gradient makes the secant history of the driver incorrect.
         assert np.all(np.isfinite(x_new))
         assert np.all(np.isfinite(g_new))
 
-    @pytest.mark.filterwarnings("ignore:invalid value encountered")  # the harness's own g0·d
+    @pytest.mark.filterwarnings("ignore:invalid value encountered")  # from g0·d in the harness
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_nonfinite_slope_at_x_is_not_a_descent_direction(self, ls):
-        """If the gradient at x is already non-finite the initial slope is NaN,
-        which is not a descent direction: the search must report failure rather
-        than run its whole budget on NaN comparisons."""
+        """If the gradient at x is already not finite, the initial slope is NaN.
+        This is not a descent direction. The search must report failure. It must
+        not use its full budget on NaN comparisons."""
 
         def f(z):
             return 1.0, np.array([np.inf, -np.inf])
@@ -446,8 +462,9 @@ class TestOverflowingObjective:
     @pytest.mark.filterwarnings("ignore:overflow encountered in exp")
     @pytest.mark.parametrize("ls", WOLFE_SEARCHES)
     def test_minimize_survives_an_overflowing_gradient(self, ls):
-        """End to end: a Poisson-style loss whose gradient overflows outside a
-        band still converges, because the line search stays in the finite region."""
+        """End to end: the gradient of a Poisson-type loss overflows outside a
+        band. The solve still converges, because the line search stays in the
+        finite region."""
         rng = np.random.default_rng(11)
         X = rng.standard_normal((200, 4))
         w_true = np.array([0.4, -0.3, 0.25, -0.1])
@@ -455,8 +472,9 @@ class TestOverflowingObjective:
 
         def fun(w):
             eta = X @ w
-            # Loss clipped for stability, gradient left unclipped: the classic
-            # mismatch that yields a finite value with an infinite gradient.
+            # The loss is clipped for stability, but the gradient is not. This is
+            # a frequent mismatch. It gives a finite value with an infinite
+            # gradient.
             f = float(np.exp(np.clip(eta, -500.0, 500.0)).sum() - y @ eta)
             g = X.T @ (np.exp(eta) - y)
             return f, g
@@ -467,8 +485,8 @@ class TestOverflowingObjective:
 
 
 # --------------------------------------------------------------------------- #
-# `Params` rejects unusable configurations at construction time, so a bad knob
-# surfaces where it was set rather than deep inside a line search.
+# `Params` rejects unusable configurations at construction time. Thus a bad
+# setting shows where you set it, not deep in a line search.
 # --------------------------------------------------------------------------- #
 class TestParamsValidation:
     @pytest.mark.parametrize(
@@ -486,7 +504,7 @@ class TestParamsValidation:
             {"line_search": "hager-zhang", "ls_c2": 0.05},  # needs _HZ_DELTA < c2 < 1
             {"line_search": "hager-zhang", "ls_c2": 1.0},
             {"line_search": "lewis-overton", "ls_c1": 0.95, "ls_c2": 0.9},  # needs c1 < c2
-            {"line_search": "hz", "l1_lambda": 0.5},  # shorthands are validated like full names
+            {"line_search": "hz", "l1_lambda": 0.5},  # short names get the same validation
             {"line_search": "lo", "ls_c1": 0.95, "ls_c2": 0.9},
         ],
         ids=lambda kw: ",".join(f"{k}={v}" for k, v in kw.items()),
@@ -496,7 +514,7 @@ class TestParamsValidation:
             Params(**kwargs)
 
     def test_minimize_revalidates_after_mutation(self):
-        """`Params` is a plain mutable dataclass, so `minimize` checks again."""
+        """`Params` is a plain mutable dataclass, so `minimize` validates it again."""
         p = Params()
         p.line_search = "nonsense"
         with pytest.raises(ValueError, match="unknown line_search"):
@@ -504,8 +522,8 @@ class TestParamsValidation:
 
     @pytest.mark.parametrize("short, full", sorted(_linesearch.ALIASES.items()))
     def test_short_names_mean_the_full_ones(self, short, full):
-        """The shorthands "lo" and "hz" select the same search as the full name:
-        same validation, same dispatch, same path."""
+        """The short names "lo" and "hz" select the same search as the full
+        names: the same validation, the same dispatch and the same path."""
         assert _linesearch.canonical_name(short) == full
         assert _linesearch.canonical_name(full) == full
         fn, _ = _well_conditioned_quad()
@@ -516,7 +534,7 @@ class TestParamsValidation:
         assert a.nfev == b.nfev
 
     def test_unknown_name_lists_every_accepted_spelling(self):
-        """The error names both the full names and the shorthands."""
+        """The error message contains the full names and the short names."""
         with pytest.raises(ValueError) as exc:
             Params(line_search="lewis_overton")
         for name in (*_linesearch.LINE_SEARCHES, *_linesearch.ALIASES):
@@ -534,14 +552,14 @@ class TestParamsValidation:
         np.testing.assert_array_equal(x0, before)
 
     def test_integer_x0_is_promoted(self):
-        """An int array must not silently truncate every step to zero."""
+        """An integer array must not truncate each step to zero."""
         r = minimize(_bowl, np.array([3, -4]))
         assert r.theta.dtype == np.float64
         assert r.reason == "gtol"
 
 
 # --------------------------------------------------------------------------- #
-# The termination reasons and the diagnostic bookkeeping.
+# The stop reasons and the diagnostic records.
 # --------------------------------------------------------------------------- #
 class TestResultReporting:
     def test_counters_agree_with_history(self):
@@ -554,21 +572,22 @@ class TestResultReporting:
         r = minimize(counted, np.array([5.0, -3.0, 1.0]))
         assert r.nit == len(r.history)
         assert r.nfev == n_calls[0]
-        assert r.nfev > r.nit  # the initial evaluation, plus at least one per iteration
+        assert r.nfev > r.nit  # the initial evaluation, and at least one for each iteration
 
     @pytest.mark.parametrize("dim", [4, 400])
     def test_rms_grad_is_an_rms_not_a_norm(self, dim):
-        """`rms_grad` must be ||pg||/sqrt(dim), which is what `gtol` is compared
-        against: the same per-component gradient at very different dimensions
-        reports the same number, where a raw L2 norm would not."""
+        """`rms_grad` must be ||pg||/sqrt(dim). The solver compares this value
+        with `gtol`. The same per-component gradient gives the same value at very
+        different dimensions. A raw L2 norm does not."""
         r = minimize(
             lambda x: (float(x.sum()), np.full_like(x, 0.25)), np.zeros(dim), Params(max_iter=0)
         )
         assert r.rms_grad == pytest.approx(0.25, rel=1e-14)
 
     def test_gtol_beats_the_iteration_budget(self):
-        """An x0 that is already optimal reports "gtol", even with no budget: the
-        convergence test runs before the iteration count is consulted."""
+        """An x0 that is already optimal gives "gtol", also with no budget. The
+        solver does the convergence test before it examines the iteration
+        count."""
         r = minimize(_bowl, np.zeros(3), Params(max_iter=0))
         assert r.reason == "gtol"
         assert r.converged
@@ -576,7 +595,7 @@ class TestResultReporting:
         assert len(r.history) == 0
 
     def test_max_iter(self):
-        """An ill-conditioned problem cannot be solved in two iterations."""
+        """The solver cannot solve an ill-conditioned problem in two iterations."""
         fn, _ = _ill_conditioned_quad()
         r = minimize(fn, np.zeros(30), Params(max_iter=2))
         assert r.reason == "max_iter"
@@ -584,8 +603,8 @@ class TestResultReporting:
         assert r.nit == len(r.history) == 2
 
     def test_no_direction(self):
-        """Under L1 with lambda large enough to zero every coordinate, the orthant
-        projection kills the whole direction."""
+        """With L1, if lambda is sufficiently large to set all coordinates to
+        zero, the orthant projection removes the full direction."""
         r = minimize(
             lambda x: (0.0, np.zeros_like(x)), np.zeros(4), Params(l1_lambda=1.0, gtol=0.0)
         )
@@ -593,11 +612,13 @@ class TestResultReporting:
         assert not r.converged
 
     def test_precision_loss_is_a_soft_success(self):
-        """A line-search failure with the gradient already inside
-        ls_stall_factor*gtol is a benign stall, reported as converged."""
+        """If the line search fails and the gradient is already within
+        ls_stall_factor*gtol, this is a benign stall. The solver reports it as
+        converged."""
         fn, _ = _ill_conditioned_quad()
-        # gtol far below the value-based floor, so Lewis-Overton cannot verify a
-        # decrease; a generous stall factor puts the failure in the benign band.
+        # gtol is much below the value-based floor, so Lewis-Overton cannot
+        # verify a decrease. A large stall factor puts the failure in the benign
+        # band.
         common = dict(line_search="lewis-overton", gtol=1e-9, max_iter=3000)
         hard = minimize(fn, np.zeros(30), Params(**common))
         soft = minimize(fn, np.zeros(30), Params(**common, ls_stall_factor=1e6))
@@ -606,12 +627,14 @@ class TestResultReporting:
         assert not hard.converged
         assert soft.reason == "precision_loss"
         assert soft.converged
-        # Same stopping point either way; only the verdict on it differs.
+        # The stop point is the same. Only the classification of the result is
+        # different.
         np.testing.assert_array_equal(hard.theta, soft.theta)
 
     def test_ls_failed_on_a_wrong_gradient(self):
-        """The classic user error, a gradient that does not match the objective,
-        must surface as ls_failed rather than silent nonsense."""
+        """A frequent user error is a gradient that does not agree with the
+        objective. This error must give ls_failed, not an incorrect result with
+        no warning."""
         r = minimize(lambda x: (0.5 * float(x.dot(x)), -x), np.array([2.0, 1.0]))
         assert r.reason == "ls_failed"
         assert not r.converged
@@ -627,7 +650,7 @@ class TestResultReporting:
 
 
 # --------------------------------------------------------------------------- #
-# `Params.l1_mask` exempts the listed coordinates from the penalty.
+# The L1 penalty does not apply to the coordinates in `Params.l1_mask`.
 # --------------------------------------------------------------------------- #
 class TestL1Mask:
     def test_masked_coordinates_are_unpenalized(self):
@@ -636,16 +659,16 @@ class TestL1Mask:
         r = minimize(fn, np.zeros(30), Params(l1_lambda=lam, l1_mask=exempt, gtol=_OWLQN_GTOL))
         assert r.reason == "gtol"
         g = fn(r.theta)[1]
-        # Exempt coordinates see no penalty, so they must be plain stationary.
+        # Exempt coordinates have no penalty, so they must be stationary.
         np.testing.assert_allclose(g[exempt], 0.0, atol=1e-5)
-        # Penalized coordinates obey the L1 subgradient bound |g_i| <= lambda.
+        # Penalised coordinates satisfy the L1 subgradient bound |g_i| <= lambda.
         assert np.abs(g[2:]).max() <= lam + 1e-5
 
     def test_boolean_mask_is_accepted(self):
         mask = np.zeros(6, dtype=bool)
         mask[[1, 3]] = True  # exempt coordinates 1 and 3
 
-        def fn(v):  # separable: unpenalized optimum at 1, L1-shrunk optimum at 1 - lambda
+        def fn(v):  # separable: optimum at 1 with no penalty, at 1 - lambda with L1
             return 0.5 * float(v.dot(v)) - v.sum(), v - 1.0
 
         by_bool = minimize(fn, np.zeros(6), Params(l1_lambda=0.5, l1_mask=mask, gtol=1e-12))
@@ -662,11 +685,11 @@ class TestL1Mask:
 
 
 # --------------------------------------------------------------------------- #
-# The numba kernels, pinned to independent references. The pseudo-gradient is
-# the whole basis of OWL-QN, so it gets the closest look.
+# The numba kernels, compared with independent references. OWL-QN uses the
+# pseudo-gradient for all of its work, so it gets the most careful check.
 # --------------------------------------------------------------------------- #
 def _reference_pseudo_gradient(g, x, lam, mask):
-    """Andrew & Gao (2007) sec. 3, transcribed one branch per case."""
+    """Andrew & Gao (2007) sec. 3, with one branch for each case."""
     out = np.empty_like(g)
     for i in range(len(g)):
         if not mask[i]:
@@ -679,7 +702,7 @@ def _reference_pseudo_gradient(g, x, lam, mask):
             out[i] = g[i] + lam
         elif g[i] - lam > 0:  # at zero: left partial derivative is positive
             out[i] = g[i] - lam
-        else:  # 0 is in the subdifferential; the coordinate stays pinned
+        else:  # 0 is in the subdifferential; the coordinate stays at zero
             out[i] = 0.0
     return out
 
@@ -690,7 +713,7 @@ class TestKernels:
         for _ in range(300):
             n = int(rng.integers(1, 30))
             x = rng.standard_normal(n) * rng.choice([0.0, 1.0, 5.0])
-            x[rng.random(n) < 0.4] = 0.0  # plenty of exact zeros, the interesting case
+            x[rng.random(n) < 0.4] = 0.0  # many exact zeros, the important case
             g = rng.standard_normal(n) * rng.choice([1e-2, 1.0, 1e2])
             lam = float(rng.choice([0.0, 1e-8, 0.1, 1.0, 10.0]))
             mask = rng.random(n) > 0.2
@@ -699,8 +722,8 @@ class TestKernels:
             np.testing.assert_array_equal(got, want)
 
     def test_pseudo_gradient_is_a_descent_direction_for_the_total_objective(self):
-        """-pg must actually go downhill on f + lambda*||x||_1, including at the
-        kinks where some coordinates sit at exactly zero."""
+        """-pg must go downhill on f + lambda*||x||_1. This includes the kinks,
+        where some coordinates are exactly zero."""
         rng = np.random.default_rng(1)
         lam, n = 0.7, 8
         n_checked = 0
@@ -715,7 +738,7 @@ class TestKernels:
 
             pg = _kernels._pseudo_gradient(A @ x - b, x, lam, np.ones(n, dtype=bool))
             if np.linalg.norm(pg) < 1e-12:
-                continue  # already optimal, nothing to descend
+                continue  # already optimal; no descent is possible
             d = -pg / np.linalg.norm(pg)
             t = 1e-7
             assert (total(x + t * d) - total(x)) / t <= 1e-6
@@ -739,8 +762,8 @@ class TestKernels:
             assert _kernels._total_objective(f, x, lam, mask) == pytest.approx(want, rel=1e-14)
 
     def test_norm2_agrees_with_an_exact_reference(self):
-        """_norm2 runs with fastmath, which lets numba reassociate the reduction.
-        That is safe because every term is non-negative, but check it anyway."""
+        """_norm2 uses fastmath, which lets numba reassociate the reduction. This
+        is safe because all terms are non-negative, but this test checks it."""
         rng = np.random.default_rng(3)
         for _ in range(200):
             n = int(rng.integers(1, 5000))
@@ -750,24 +773,24 @@ class TestKernels:
 
 
 # --------------------------------------------------------------------------- #
-# The two-loop recursion is an implicit matrix-vector product; check it against
-# the same product formed explicitly.
+# The two-loop recursion is an implicit matrix-vector product. Compare it with
+# the same product, calculated explicitly.
 # --------------------------------------------------------------------------- #
 def _random_pairs(rng, n, k):
-    """Up to k (s, y, 1/sᵀy) triples with comfortably positive curvature."""
+    """Up to k (s, y, 1/sᵀy) triples with clearly positive curvature."""
     pairs = []
     for _ in range(k):
         s = rng.standard_normal(n)
         y = s * rng.uniform(0.5, 2.0) + 0.05 * rng.standard_normal(n)
-        if s.dot(y) > 1e-9:  # only pairs the driver's guard would accept
+        if s.dot(y) > 1e-9:  # only pairs that the driver guard accepts
             pairs.append((s, y, 1.0 / s.dot(y)))
     return pairs
 
 
 class TestTwoLoopRecursion:
     def test_matches_the_dense_bfgs_recursion(self):
-        """d must equal -H@pg with H built by Nocedal & Wright eq. 6.17, starting
-        from the same gamma*I the implicit version uses."""
+        """d must be equal to -H@pg, with H from Nocedal & Wright eq. 6.17. H
+        starts from the same gamma*I that the implicit version uses."""
         rng = np.random.default_rng(4)
         for _ in range(100):
             n, k = int(rng.integers(2, 15)), int(rng.integers(1, 8))
@@ -785,8 +808,8 @@ class TestTwoLoopRecursion:
             )
 
     def test_satisfies_the_secant_condition(self):
-        """With a single pair, H must map y to s exactly: the defining property
-        of a quasi-Newton update."""
+        """With one pair, H must change y to exactly s. This is the property that
+        defines a quasi-Newton update."""
         rng = np.random.default_rng(5)
         s = rng.standard_normal(6)
         y = s * 1.3 + 0.01 * rng.standard_normal(6)
@@ -804,21 +827,21 @@ class TestTwoLoopRecursion:
         np.testing.assert_array_equal(pg, before)
 
     def test_converges_with_a_short_history_window(self):
-        """m = 3 on a 30-dimensional ill-conditioned problem: pairs age out of
-        the window on every iteration, and the solve must still get there."""
+        """m = 3 on a 30-dimensional ill-conditioned problem. Pairs leave the
+        window on each iteration, and the solve must still converge."""
         fn, x_star = _ill_conditioned_quad()
         r = minimize(fn, np.zeros(30), Params(m=3, max_iter=20000, gtol=1e-4))
         assert r.reason == "gtol"
-        assert r.nit > 3  # the window really did roll over
+        assert r.nit > 3  # the window was full, and old pairs left it
         np.testing.assert_allclose(r.theta, x_star, atol=1e-3)
 
 
 # --------------------------------------------------------------------------- #
-# OWL-QN must land on the true LASSO optimum, not merely somewhere sparse.
+# OWL-QN must find the true LASSO optimum, not only a sparse point.
 # --------------------------------------------------------------------------- #
 def _fista(X, y, lam, n_iter=100000):
-    """Independent reference solver: accelerated proximal gradient. Shares no
-    code with the package, so agreement is real evidence."""
+    """Independent reference solver: accelerated proximal gradient. It has no
+    code in common with the package, so agreement is real evidence."""
     L = float(np.linalg.eigvalsh(X.T @ X).max())
     w = np.zeros(X.shape[1])
     z, t = w.copy(), 1.0
@@ -842,17 +865,17 @@ class TestOwlQnOptimality:
         )
         w_ref = _fista(X, y, lam)
 
-        def total(w):  # the full LASSO objective, for comparing the two answers
+        def total(w):  # the full LASSO objective, to compare the two answers
             return 0.5 * np.sum((X @ w - y) ** 2) + lam * np.abs(w).sum()
 
         assert r.reason == "gtol"
-        # Never worse than the reference, and at the same point.
+        # The result is not worse than the reference, and it is at the same point.
         assert total(r.theta) <= total(w_ref) * (1 + 1e-9)
         np.testing.assert_allclose(r.theta, w_ref, atol=1e-5)
 
     def test_satisfies_the_kkt_conditions(self):
-        """At the L1 optimum: g_i = -lambda*sign(w_i) on the support, and
-        |g_i| <= lambda off it."""
+        """At the L1 optimum, g_i = -lambda*sign(w_i) on the support, and
+        |g_i| <= lambda outside it."""
         lam = 1.5
         fn, X, _ = _lasso_problem(np.random.default_rng(8), n=150, p_dim=30, nnz=9)
         r = minimize(
@@ -866,7 +889,8 @@ class TestOwlQnOptimality:
         assert np.abs(g[~support]).max() <= lam + 1e-5
 
     def test_coefficients_reach_exactly_zero(self):
-        """The point of the orthant projection: sparsity, not just small values."""
+        """This is the purpose of the orthant projection: coefficients that are
+        exactly zero, not only small."""
         fn, X, _ = _lasso_problem(np.random.default_rng(9), nnz=3)
         r = minimize(
             fn, np.zeros(X.shape[1]), Params(l1_lambda=20.0, max_iter=5000, gtol=_OWLQN_GTOL)

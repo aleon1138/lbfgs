@@ -1,21 +1,23 @@
 """
-lbfgs — a small L-BFGS optimizer, pure Python with a few numba kernels.
+lbfgs: a small L-BFGS optimiser in pure Python, with some numba kernels.
 
-It offers two things the SciPy optimizers don't:
+It has two functions that the SciPy optimisers do not have:
 
-* **OWL-QN**, an L1-regularized quasi-Newton method for sparse, LASSO-style fits.
-  It keeps the L-BFGS curvature model on the smooth part of the objective.
-  SciPy's ``L-BFGS-B`` handles box constraints but has no notion of an L1
+* **OWL-QN**, a quasi-Newton method with L1 regularisation, for sparse
+  LASSO-type fits. It keeps the L-BFGS curvature model on the smooth part of the
+  objective. SciPy ``L-BFGS-B`` accepts box constraints, but it has no L1
   penalty.
-* The **Hager-Zhang** approximate-Wolfe line search, which tolerates
-  floating-point roundoff near the optimum and so keeps making progress on flat
-  or ill-conditioned directions where a value-based Wolfe search stalls.
+* The **Hager-Zhang** approximate-Wolfe line search. It tolerates
+  floating-point roundoff error near the optimum. Thus it continues to make
+  progress on flat or ill-conditioned directions, where a value-based Wolfe
+  search stops.
 
-A third line search, **Lewis-Overton** weak Wolfe, sits between the default
-backtracking Armijo and Hager-Zhang: the simplest search that guarantees the
-curvature condition, and the control the other two are compared against.
+A third line search, **Lewis-Overton** weak Wolfe, is between the default
+backtracking Armijo search and Hager-Zhang. It is the simplest search that
+guarantees the curvature condition. It is also the control for the comparison
+of the other two.
 
-There is a single entry point::
+There is one entry point::
 
     import lbfgs
     res = lbfgs.minimize(fun, x0)                                             # plain L-BFGS
@@ -24,11 +26,11 @@ There is a single entry point::
     res = lbfgs.minimize(fun, x0, lbfgs.Params(line_search="hager-zhang"))    # approximate Wolfe
     res = lbfgs.minimize(fun, x0, args=(A, b))                                # calls fun(x, A, b)
 
-``fun(x, *args) -> (f, grad)`` returns the *smooth* objective and its gradient;
-the L1 term, if any, is added internally. ``line_search`` also takes the
-shorthands ``"lo"`` and ``"hz"``. :class:`Result` holds the optimum and a
-per-iteration diagnostic history. The README has the rationale, tuning guidance
-and a troubleshooting checklist.
+``fun(x, *args) -> (f, grad)`` returns the *smooth* objective and its gradient.
+If there is an L1 term, the package adds it internally. ``line_search`` also
+accepts the short names ``"lo"`` and ``"hz"``. :class:`Result` contains the
+optimum and a diagnostic history for each iteration. The README gives the
+rationale, tuning instructions and a troubleshooting checklist.
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -37,7 +39,7 @@ from ._core import Params, Result, minimize
 
 try:
     __version__ = version("lbfgs")
-except PackageNotFoundError:  # running from a source tree that was never installed
+except PackageNotFoundError:  # the source tree is not installed
     __version__ = "0.0.0.dev0"
 
 __all__ = ["minimize", "Params", "Result", "__version__"]

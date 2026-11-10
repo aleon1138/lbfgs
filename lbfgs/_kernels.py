@@ -1,13 +1,13 @@
 """
 Numba kernels for the ``lbfgs`` package.
 
-These are the element-wise and reduction inner loops. They live in their own
-module so that both :mod:`lbfgs._core` and :mod:`lbfgs._linesearch` can import
+These kernels are the element-wise loops and the reduction loops. They are in a
+separate module, so :mod:`lbfgs._core` and :mod:`lbfgs._linesearch` can import
 them without a circular dependency.
 
-Every L1 kernel takes a boolean ``mask`` marking the coordinates the penalty
-applies to. That is the *complement* of :attr:`lbfgs.Params.l1_mask`, which
-lists the coordinates to exempt.
+Each L1 kernel has a boolean ``mask`` argument. The mask shows the coordinates
+where the penalty applies. It is the *complement* of
+:attr:`lbfgs.Params.l1_mask`, which lists the exempt coordinates.
 """
 
 import numba
@@ -19,14 +19,15 @@ def _norm2(x: np.ndarray) -> float:
     """
     Euclidean norm ``‖x‖₂``.
 
-    ``fastmath`` is what makes a hand-rolled loop worth having. Without it numba
-    will not reassociate the accumulator, so the loop stays scalar and loses to
-    BLAS past a few thousand elements. Reassociation is safe here because every
-    term is non-negative, so there is nothing to cancel catastrophically; over
-    2000 random vectors the result matched an extended-precision reference to
-    3.4e-15 relative, the same as the strict-order loop.
+    ``fastmath`` is the reason for this hand-written loop. Without it, numba does
+    not reassociate the accumulator. The loop then stays scalar, and BLAS is
+    faster above a few thousand elements. Reassociation is safe here, because all
+    terms are non-negative. Thus no catastrophic cancellation can occur. Over
+    2000 random vectors, the result agreed with an extended-precision reference to
+    3.4e-15 relative. This is the same as for the strict-order loop.
 
-    Measured µs per call against the alternatives, for vectors of length ``n``:
+    Measured µs per call, compared with the alternatives, for vectors of length
+    ``n``:
 
     ==========  ======  ================  ===================
     n           this    ``np.linalg``     ``np.sqrt(x.dot(x))``
@@ -37,9 +38,10 @@ def _norm2(x: np.ndarray) -> float:
     100_000      10.7               9.45                  8.54
     ==========  ======  ================  ===================
 
-    A clear win below roughly 10k elements, where numpy's dispatch overhead
-    dominates the arithmetic, and a wash above that. The low end is the range the
-    optimizer's own per-iteration overhead is measured in.
+    Below approximately 10k elements, this function is clearly faster. In that
+    range, the numpy dispatch overhead is larger than the arithmetic. Above that,
+    there is no significant difference. The per-iteration overhead of the
+    optimiser is in the low range.
     """
     z = 0.0
     for i in range(len(x)):
@@ -50,17 +52,17 @@ def _norm2(x: np.ndarray) -> float:
 @numba.njit
 def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarray:
     """
-    Pseudo-gradient of ``f(x) + lam·‖x‖₁``, Andrew & Gao's ⋄ operator.
+    Pseudo-gradient of ``f(x) + lam·‖x‖₁`` (the ⋄ operator of Andrew & Gao).
 
-    Where ``x_i != 0`` the objective is differentiable, so the entry is the
-    ordinary gradient ``g_i + lam·sign(x_i)``. Where ``x_i == 0`` the
-    subdifferential is the interval ``[g_i - lam, g_i + lam]``, and the entry is
-    its element of smallest magnitude, which is the soft-threshold of ``g_i``.
-    That is exactly zero when the interval straddles zero, meaning the
-    coordinate is already optimal and stays pinned there.
+    Where ``x_i != 0``, the objective is differentiable. The entry is then the
+    usual gradient ``g_i + lam·sign(x_i)``. Where ``x_i == 0``, the
+    subdifferential is the interval ``[g_i - lam, g_i + lam]``. The entry is then
+    the element of this interval with the smallest magnitude. This is the soft
+    threshold of ``g_i``. If the interval contains zero, the entry is exactly
+    zero. This means that the coordinate is already optimal, and it stays at zero.
 
-    Vectorized numpy takes about 9.5x longer than this loop, because the two
-    branches force it to compute both arms and then select.
+    Vectorised numpy is approximately 9.5x slower than this loop. The two
+    branches force numpy to calculate the two results and then select one.
     """
     if lam == 0.0:
         return g.copy()
@@ -71,7 +73,7 @@ def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarr
             if x[i] != 0.0:
                 pg[i] = g[i] + np.copysign(lam, x[i])
             else:
-                pg[i] = np.copysign(max(abs(g[i]) - lam, 0.0), g[i])  # soft-threshold
+                pg[i] = np.copysign(max(abs(g[i]) - lam, 0.0), g[i])  # soft threshold
         else:
             pg[i] = g[i]  # exempt from the penalty
     return pg
@@ -79,7 +81,7 @@ def _pseudo_gradient(g: np.ndarray, x: np.ndarray, lam: float, mask) -> np.ndarr
 
 @numba.njit
 def _total_objective(f_smooth: float, x: np.ndarray, lam: float, mask) -> float:
-    """The regularized objective ``f(x) + lam·‖x‖₁``, with the norm over ``mask`` only."""
+    """The regularised objective ``f(x) + lam·‖x‖₁``, with the norm over ``mask`` only."""
     if lam == 0.0:
         return f_smooth
     norm_1 = 0.0

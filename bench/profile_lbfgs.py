@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Simple profiling harness for ``lbfgs.minimize`` — where does the time go?
+Simple profile harness for ``lbfgs.minimize``. It shows where the time goes.
 
     python bench/profile_lbfgs.py
 
 It does four things:
 
-1. Warms up numba's JIT (otherwise the first call's compile time dwarfs
-   everything and the numbers are meaningless).
-2. Wall-clock (best-of-N) across problem types and sizes.
-3. Splits the wall clock into time spent in the user's ``fun`` (the
-   objective/gradient) vs. the optimizer's own overhead.
-4. Dumps a cProfile of the internals, sorted by total time, for two regimes:
-   a realistic loss (matvec-dominated) and a deliberately cheap loss (so the
-   optimizer's pure-Python overhead is what's left).
+1. It compiles the numba JIT kernels before the timing starts. Without this
+   step, the compile time of the first call is much larger than all other
+   times, and the numbers have no meaning.
+2. It measures the wall-clock time (best of N) for different problem types and
+   sizes.
+3. It divides the wall-clock time into the time in the user ``fun`` (the
+   objective and the gradient) and the overhead of the optimiser.
+4. It prints a cProfile of the internals, sorted by total time, for two cases.
+   The first case is a realistic loss, where matrix-vector products use most of
+   the time. The second case is an intentionally cheap loss, where the
+   remaining time is the pure-Python overhead of the optimiser.
 """
 
 import cProfile
@@ -27,11 +30,11 @@ from lbfgs import Params, minimize
 
 
 # --------------------------------------------------------------------------- #
-# Problem generators. Each returns (fun, x0, params, label).
-# fun(x) -> (f_smooth, grad_smooth); the L1 term (if any) is added internally.
+# Problem generators. Each generator returns (fun, x0, params, label).
+# fun(x) -> (f_smooth, grad_smooth). The optimiser adds the L1 term, if there is one.
 # --------------------------------------------------------------------------- #
 def quadratic(n, line_search="armijo", seed=0):
-    """Dense well-conditioned quadratic. Realistic O(n^2) matvec per eval."""
+    """Dense well-conditioned quadratic. Each evaluation has a realistic O(n^2) matvec."""
     rng = np.random.default_rng(seed)
     M = rng.standard_normal((n, n))
     A = M.T @ M + np.eye(n)
@@ -46,10 +49,10 @@ def quadratic(n, line_search="armijo", seed=0):
 
 
 def lasso(n_samples, n_features, n_nonzero, lam=0.05, seed=42):
-    """Sparse linear regression (L1 / OWL-QN). Matvec is the (n_f x n_f) XtX.
+    """Sparse linear regression (L1 / OWL-QN). The matvec uses the (n_f x n_f) matrix XtX.
 
-    The objective is normalized by ``n_samples`` (per the library's own
-    guidance) so the gradient is O(1) and ``lam`` is on a sane scale.
+    The objective is divided by ``n_samples``, as the library instructions
+    recommend. Thus the gradient is O(1), and ``lam`` has a correct scale.
     """
     rng = np.random.default_rng(seed)
     w = np.zeros(n_features)
@@ -69,8 +72,9 @@ def lasso(n_samples, n_features, n_nonzero, lam=0.05, seed=42):
 
 
 def cheap_highdim(n, seed=0):
-    """Separable quadratic: fun is O(n), so the optimizer's own per-iteration
-    overhead (two-loop recursion, pseudo-gradient, allocations) dominates."""
+    """Separable quadratic. fun is O(n), so the per-iteration overhead of the
+    optimiser (two-loop recursion, pseudo-gradient, allocations) is the largest
+    cost."""
     rng = np.random.default_rng(seed)
     d = rng.uniform(0.5, 2.0, n)  # diagonal Hessian
     b = rng.standard_normal(n)
@@ -83,7 +87,7 @@ def cheap_highdim(n, seed=0):
 
 # --------------------------------------------------------------------------- #
 class _Timed:
-    """Wrap fun to accumulate the wall time spent inside it."""
+    """Wrapper for fun that adds up the wall time in each call."""
 
     def __init__(self, fun):
         self.fun = fun
@@ -100,11 +104,12 @@ class _Timed:
 
 def warmup():
     """
-    Trigger numba compilation for every jitted kernel branch before timing.
+    Compile all numba kernel branches before the timing starts.
 
-    The kernels in ``lbfgs._kernels`` specialize on ``lam == 0`` vs ``lam > 0``,
-    so a smooth solve and an L1 solve are both needed; the line searches are pure
-    Python but are exercised here anyway so the first timed call is warm.
+    The kernels in ``lbfgs._kernels`` have different branches for ``lam == 0``
+    and ``lam > 0``. Thus the warm-up needs a smooth solve and an L1 solve. The
+    line searches are pure Python, but the warm-up also runs them. Thus the
+    first timed call is warm.
     """
     f, x0, p, _ = quadratic(6, seed=1)
     minimize(f, x0, p)
@@ -132,7 +137,7 @@ def wall_clock_table(problems):
     for fun, x0, params, label in problems:
         best, res = best_of(fun, x0, params)
         iters = len(res.history)
-        # measure the fun/opt split on one fresh, wrapped solve
+        # measure the fun/opt split on one new solve with the wrapper
         timed = _Timed(fun)
         t0 = time.perf_counter()
         res = minimize(timed, x0.copy(), params)
@@ -151,9 +156,9 @@ def profile(fun, x0, params, label, top=15):
     s = io.StringIO()
     pstats.Stats(pr, stream=s).strip_dirs().sort_stats("tottime").print_stats(top)
     print(f"\n===== cProfile (tottime, top {top}) — {label} =====")
-    # Keep only the table rows, dropping the cProfile preamble. `strip_dirs()`
-    # leaves bare filenames, so match the package's module names rather than a
-    # path -- and list all of them, or the line-search and kernel rows vanish.
+    # Keep only the table rows, and remove the cProfile preamble. `strip_dirs()`
+    # leaves bare file names. Thus match the module names of the package, not a
+    # path. List all of the modules, or the line-search and kernel rows are lost.
     keys = ("function calls", "ncalls", "{", "_core.py", "_kernels.py", "_linesearch.py")
     for line in s.getvalue().splitlines():
         if line.strip() and any(k in line for k in keys):
@@ -176,10 +181,10 @@ if __name__ == "__main__":
     ]
     wall_clock_table(problems)
 
-    # Realistic, matvec-dominated:
+    # Realistic case: matrix-vector products use most of the time.
     f, x0, p, lbl = lasso(20000, 2000, 25)
     profile(f, x0, p, lbl)
 
-    # Cheap loss: optimizer's own overhead is what remains.
+    # Cheap loss: the remaining time is the overhead of the optimiser.
     f, x0, p, lbl = cheap_highdim(8000)
     profile(f, x0, p, lbl)

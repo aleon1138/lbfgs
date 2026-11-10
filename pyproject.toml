@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lbfgs"
 version = "0.5"
-description = "L-BFGS / OWL-QN optimizer with Armijo, Hager-Zhang and Lewis-Overton line searches"
+description = "L-BFGS / OWL-QN optimiser with Armijo, Hager-Zhang and Lewis-Overton line searches"
 readme = "README.md"
 authors = [
     { name = "Arnaldo Leon", email = "amleon@alum.mit.edu" },
 ]
 requires-python = ">=3.10"
-# numba 0.60 is the first release supporting NumPy 2.x.
+# numba 0.60 is the first release that supports NumPy 2.x.
 dependencies = ["numpy>=1.24", "numba>=0.60"]
 
 [project.optional-dependencies]
@@ -24,10 +24,10 @@ include = ["lbfgs*"]
 Source = "https://github.com/aleon1138/lbfgs"
 
 [tool.pytest.ini_options]
-# Prepend the repo root to sys.path so `import lbfgs` always resolves to this
-# working tree, not to a copy installed in site-packages. Without this, a bare
-# `pytest` (unlike `python -m pytest`, which adds the CWD) silently tests the
-# installed package instead of the code under edit.
+# Add the repo root to the start of sys.path. Thus `import lbfgs` always uses this
+# working tree, not a copy in site-packages. Without this setting, a bare `pytest`
+# tests the installed package, not the code that you edit, and gives no warning.
+# (`python -m pytest` adds the CWD to sys.path, but a bare `pytest` does not.)
 pythonpath = ["."]
 testpaths = ["test"]
 
